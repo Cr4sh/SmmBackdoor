@@ -1,7 +1,12 @@
 
-  SMM backdoor for UEFI based platforms.
+  SMM backdoor for UEFI based platforms
 
 *****************************************************************
+
+For more information about this project please read the following article:
+
+http://blog.cr4.sh/2015/07/building-reliable-smm-backdoor-for-uefi.html
+
 
 Repository contents:
 
