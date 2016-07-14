@@ -2,7 +2,7 @@ import sys, os, shutil
 from struct import pack, unpack
 from optparse import OptionParser, make_option
 
-CHIPSEC_TOOL_PATH = '/root/chipsec/source/tool'
+CHIPSEC_TOOL_PATH = '/usr/src/chipsec/source/tool'
 
 sys.path.append(CHIPSEC_TOOL_PATH)
 
@@ -55,7 +55,7 @@ efi_var_get_64 = lambda name: unpack('Q', efi_var_get(name))[0]
 
 def mem_read(addr, size): 
 
-    return cs.mem.read_phys_mem(addr, size)
+    return cs.mem.read_physical_mem(addr, size)
 
 mem_read_8 = lambda addr: unpack('B', mem_read(addr, 1))[0]
 mem_read_16 = lambda addr: unpack('H', mem_read(addr, 2))[0]
@@ -112,7 +112,7 @@ def get_smram_info():
 
 def send_sw_smi(command, data, arg):
 
-    cs.ints.send_SW_SMI(command, data, 0, 0, arg, 0, 0, 0)
+    cs.ints.send_SW_SMI(0, command, data, 0, 0, arg, 0, 0, 0)
 
 def dump_mem_page(addr, count = None):
 
@@ -336,8 +336,8 @@ def chipsec_init():
     _cs = chipsec.chipset.cs()
     _cs.init(None, True)
     
-    cs = Chipsec(chipsec.hal.uefi.UEFI(_cs.helper),
-                 chipsec.hal.physmem.Memory(_cs.helper),
+    cs = Chipsec(chipsec.hal.uefi.UEFI(_cs),
+                 chipsec.hal.physmem.Memory(_cs),
                  chipsec.hal.interrupts.Interrupts(_cs))
 
 def main():    
