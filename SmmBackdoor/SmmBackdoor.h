@@ -11,6 +11,9 @@
 
 #pragma pack(1)
 
+// idicate that SMRAM regions were copied to BACKDOOR_INFO structure
+#define BACKDOOR_INFO_FULL 0xffffffff
+
 typedef struct _INFECTOR_CONFIG
 {
     VOID *BackdoorEntryInfected;
@@ -29,6 +32,12 @@ typedef struct _BACKDOOR_INFO
 
     // EFI_STATUS of last operation
     UINTN BackdoorStatus;
+
+    // MSR_SMM_MCA_CAP register value
+    UINT64 SmmMcaCap;
+
+    // MSR_SMM_FEATURE_CONTROL register value
+    UINT64 SmmFeatureControl;
 
     // List of structures with available SMRAM regions information.
     // Zero value of EFI_SMRAM_DESCRIPTOR.PhysicalStart means last item of list.
