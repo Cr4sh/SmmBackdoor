@@ -5,8 +5,8 @@
 #define BACKDOOR_DEBUG
 #define BACKDOOR_DEBUG_SERIAL_BUILTIN
 
-// read MSR_SMM_MCA_CAP register value
-#define USE_MSR_SMM_MCA_CAP
+// automatically dump SMRAM contents into the regular physical memory on DXE exit
+#define USE_SMRAM_AUTO_DUMP
 
 // prit debug messages to console also
 #define BACKDOOR_DEBUG_SERIAL_TO_CONSOLE

