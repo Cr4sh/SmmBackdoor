@@ -1,0 +1,3 @@
+[submodule "chipsec-1.3.3"]
+	path = chipsec-1.3.3
+	url = https://github.com/chipsec/chipsec.git
