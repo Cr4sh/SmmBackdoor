@@ -25,7 +25,7 @@ INFECTOR_CONFIG_LEN = 8 + 4
 INFECTOR_SIGN = 'INFECTED'
 
 # EFI variable with struct _BACKDOOR_INFO physical address
-BACKDOOR_INFO_EFI_VAR = 'SmmBackdoorInfo-3a452e85-a7ca-438f-a5cb-ad3a70c5d01b'
+BACKDOOR_INFO_EFI_VAR = 'SmmBackdoorInfo-852e453a-caa7-8f43-a5cb-ad3a70c5d01b'
 BACKDOOR_INFO_FMT = 'QQQQQ'
 BACKDOOR_INFO_LEN = 8 * 5
 
