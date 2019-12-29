@@ -671,10 +671,12 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             break;
         }
 
-    case BACKDOOR_SW_DATA_READ_PHYS_MEM:
-    case BACKDOOR_SW_DATA_WRITE_PHYS_MEM:
+    case BACKDOOR_SW_DATA_READ_PHYS_PAGE:
+    case BACKDOOR_SW_DATA_READ_PHYS_DWORD:
+    case BACKDOOR_SW_DATA_WRITE_PHYS_PAGE:
+    case BACKDOOR_SW_DATA_WRITE_PHYS_DWORD:
         {
-            UINTN i = 0;
+            UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
 
             if (Arg1 == 0)
@@ -711,32 +713,42 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }
             }
 
-            if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
+            if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
+                Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
             {
                 DbgMsg(
-                    __FILE__, __LINE__, "Copying page from 0x%llx to "FPTR"\r\n",  
+                    __FILE__, __LINE__, "Copying data from 0x%llx to "FPTR"\r\n",  
                     Arg1, Buff
                 );
             }
-            else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_MEM)
+            else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_PAGE ||
+                     Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
             {
                 DbgMsg(
-                    __FILE__, __LINE__, "Copying page from "FPTR" to 0x%llx\r\n",  
+                    __FILE__, __LINE__, "Copying data from "FPTR" to 0x%llx\r\n",  
                     Buff, Arg1
                 );   
+            }
+
+            if (Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD ||
+                Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
+            {
+                Len = sizeof(UINT32);
             }
 
             // check for valid address
             if (VirtualAddrValid(Arg1, __readcr3()))
             {
-                for (i = 0; i < PAGE_SIZE; i += 1)
+                for (i = 0; i < Len; i += 1)
                 {
                     // copy memory contents
-                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
+                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
+                        Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
                     {                    
                         *(Buff + i) = *(PUCHAR)(Arg1 + i);
                     }
-                    else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_MEM)
+                    else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_PAGE ||
+                             Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
                     {
                         *(PUCHAR)(Arg1 + i) = *(Buff + i);
                     }
@@ -744,10 +756,11 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             }
             else
             {                
-                for (i = 0; i < PAGE_SIZE; i += 1)
+                for (i = 0; i < Len; i += 1)
                 {
                     // address is not mapped, fill with zeros
-                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_MEM)
+                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
+                        Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
                     {                    
                         *(Buff + i) = 0;
                     }
@@ -755,14 +768,15 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             }
 
             Status = EFI_SUCCESS;
-
             break;
         }
 
-    case BACKDOOR_SW_DATA_READ_VIRT_MEM:
-    case BACKDOOR_SW_DATA_WRITE_VIRT_MEM:
+    case BACKDOOR_SW_DATA_READ_VIRT_PAGE:
+    case BACKDOOR_SW_DATA_READ_VIRT_DWORD:
+    case BACKDOOR_SW_DATA_WRITE_VIRT_PAGE:
+    case BACKDOOR_SW_DATA_WRITE_VIRT_DWORD:
         {
-            UINTN i = 0;
+            UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
 
             if (Arg1 == 0)
@@ -801,14 +815,16 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
 
             if ((Status = VirtualToPhysical(Arg1, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
             {
-                if (Code == BACKDOOR_SW_DATA_READ_VIRT_MEM)
+                if (Code == BACKDOOR_SW_DATA_READ_VIRT_PAGE ||
+                    Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD)
                 { 
                     DbgMsg(
                         __FILE__, __LINE__, "Copying page from 0x%llx (VA = 0x%llx) to "FPTR"\r\n",  
                         Addr, Arg1, Buff
                     );
                 }
-                else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_MEM)
+                else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_PAGE ||
+                         Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
                 {
                     DbgMsg(
                         __FILE__, __LINE__, "Copying page from "FPTR" to 0x%llx (VA = 0x%llx)\r\n",  
@@ -816,14 +832,22 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                     );
                 }
 
-                for (i = 0; i < PAGE_SIZE; i += 1)
+                if (Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD ||
+                    Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
+                {
+                    Len = sizeof(UINT32);
+                }
+
+                for (i = 0; i < Len; i += 1)
                 {
                     // copy memory contents
-                    if (Code == BACKDOOR_SW_DATA_READ_VIRT_MEM)
+                    if (Code == BACKDOOR_SW_DATA_READ_VIRT_PAGE ||
+                        Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD)
                     {                    
                         *(Buff + i) = *(PUCHAR)(Addr + i);
                     }
-                    else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_MEM)
+                    else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_PAGE ||
+                             Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
                     {
                         *(PUCHAR)(Addr + i) = *(Buff + i);
                     }
@@ -874,6 +898,28 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 DbgMsg(__FILE__, __LINE__, "ERROR: Timer is not registered\r\n");
             }
 
+            break;
+        }
+
+    case BACKDOOR_SW_DATA_CALL:
+        {
+            typedef void (* BACKDOOR_PROC)(void);
+
+            BACKDOOR_PROC Proc = (BACKDOOR_PROC)Arg1;
+
+            if (Arg1 == 0)
+            {
+                DbgMsg(__FILE__, __LINE__, "ERROR: Arg1 must be specified\r\n");
+                
+                Status = EFI_INVALID_PARAMETER;
+                goto _end;
+            }
+
+            DbgMsg(__FILE__, __LINE__, "Calling "FPTR"\r\n", Proc);
+
+            Proc();
+
+            Status = EFI_SUCCESS;
             break;
         }
 

