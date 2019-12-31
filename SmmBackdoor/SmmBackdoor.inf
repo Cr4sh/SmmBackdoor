@@ -11,6 +11,7 @@
   printf.c
   SmmBackdoor.c
   serial.c
+  virtmem.c
 
 [Sources.X64]
   asm/amd64/common_asm.asm

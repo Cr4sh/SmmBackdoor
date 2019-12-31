@@ -4,6 +4,7 @@
 
 #define BACKDOOR_DEBUG
 #define BACKDOOR_DEBUG_SERIAL_BUILTIN
+#define BACKDOOR_DEBUG_MEM
 
 // automatically dump SMRAM contents into the regular physical memory on DXE exit
 #define USE_SMRAM_AUTO_DUMP
