@@ -30,6 +30,6 @@ BOOLEAN VirtualAddrValid(UINT64 Addr, UINT64 Cr3);
 
 EFI_STATUS VirtualToPhysical(UINT64 Addr, UINT64 *Ret, UINT64 Cr3, UINT64 SmmCr3);
 
-BOOLEAN VirtualAddrRemap(UINT64 Addr, UINT64 NewAddr, UINT64 Cr3);
+BOOLEAN VirtualAddrRemap(UINT64 Addr, UINT64 NewAddr, UINT64 Cr3, BOOLEAN *pbLargePage);
 
 #endif

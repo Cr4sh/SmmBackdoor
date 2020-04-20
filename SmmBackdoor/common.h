@@ -4,13 +4,11 @@
 
 #include "types.h"
 
-#define XALIGN_DOWN(x, align) (x &~ (align - 1))
-#define XALIGN_UP(x, align) ((x & (align - 1)) ? XALIGN_DOWN(x, align) + align : x)
-
 #define RVATOVA(_base_, _offset_) ((PUCHAR)(_base_) + (ULONG)(_offset_))
 
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 0x1000
+#define PAGE_SIZE_2M 0x200000
 
 // default raw image section alignment for EDK
 #define DEFAULT_EDK_ALIGN 0x20
