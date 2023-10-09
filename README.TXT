@@ -3,6 +3,16 @@
 
 *****************************************************************
 
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  This is legacy abandoned project, for current version of the 
+  backdoor check SMM Backdoor Next Gen project page and its 
+  documentation:
+
+  https://github.com/Cr4sh/SmmBackdoorNg
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 For more information about this project please read the following article:
 
 http://blog.cr4.sh/2015/07/building-reliable-smm-backdoor-for-uefi.html
